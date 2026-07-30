@@ -52,6 +52,31 @@ def safe_float(value: Any, fallback: float) -> float:
         return fallback
 
 
+def _standing_bo(temperature_f: float, pressure_psi: float, api: float = 30.0,
+                 gas_sg: float = 0.75) -> float:
+    """
+    Standing's correlation for oil formation volume factor (Bo).
+    Returns Bo in RB/STB.
+    """
+    gamma_o = 141.5 / (api + 131.5)
+    rs_exp = 0.0125 * api - 0.00091 * temperature_f
+    rs = gas_sg * ((pressure_psi / 18.2 + 1.4) * (10 ** rs_exp)) ** 1.2048
+    F = rs * ((gas_sg / gamma_o) ** 0.5) + 1.25 * temperature_f
+    bo = 0.972 + 0.000147 * (max(0.0, F) ** 1.175)
+    return round(bo, 4)
+
+
+def _calculate_ooip(area_acres: float, thickness_ft: float, porosity_frac: float,
+                    water_sat_frac: float, bo: float) -> float:
+    """
+    Volumetric OOIP formula (oilfield units):
+        OOIP (STB) = 7758 × A (acres) × h (ft) × φ × (1 - Sw) / Bo
+    """
+    if bo <= 0:
+        bo = 1.2
+    return 7758.0 * area_acres * thickness_ft * porosity_frac * (1.0 - water_sat_frac) / bo
+
+
 def run_baseline_simulation(simulation_id: int):
     """
     Execute baseline simulation in background thread
@@ -124,13 +149,76 @@ def run_baseline_simulation(simulation_id: int):
               file=sys.stderr, flush=True)
         
         # Generate mock results
+        oil_predicted = float(np.random.uniform(50000, 100000))
+        water_predicted = float(np.random.uniform(10000, 50000))
+        gas_predicted = float(np.random.uniform(500000, 1000000))
+        pressure_predicted = float(np.random.uniform(1000, 3000))
+
+        # ── OOIP Calculation ─────────────────────────────────────────────────
+        ooip_data = {}
+        try:
+            area_acres   = safe_float(simulation.area, 0.0)
+            thickness_ft = safe_float(simulation.thickness, 0.0)
+            porosity_frac = safe_float(simulation.porosity, 0.0)
+            # porosity stored as % in the model; convert to fraction
+            if porosity_frac > 1.0:
+                porosity_frac /= 100.0
+            water_sat_frac = safe_float(simulation.water_saturation, 0.0)
+            if water_sat_frac > 1.0:
+                water_sat_frac /= 100.0
+
+            # Use stored Bo or auto-compute from Standing's
+            bo = safe_float(simulation.oil_formation_volume_factor, 0.0)
+            bo_source = 'user'
+            if bo <= 0:
+                temp_f    = safe_float(simulation.temperature, 180.0)
+                press_psi = safe_float(simulation.initial_pressure, 3000.0)
+                bo = _standing_bo(temp_f, press_psi)
+                bo_source = "Standing's correlation"
+
+            if area_acres > 0 and thickness_ft > 0 and porosity_frac > 0:
+                ooip_stb = _calculate_ooip(area_acres, thickness_ft, porosity_frac,
+                                           water_sat_frac, bo)
+                # Forecast cumulative production over 365 days (simple decline model)
+                cum_oil_365 = oil_predicted * 365 * 0.85  # 85% efficiency factor
+                remaining_ooip = max(0.0, ooip_stb - cum_oil_365)
+                recovery_factor = min(100.0, (cum_oil_365 / ooip_stb) * 100) if ooip_stb > 0 else 0.0
+
+                ooip_data = {
+                    'ooip_stb': round(ooip_stb, 0),
+                    'ooip_mmbbl': round(ooip_stb / 1_000_000, 3),
+                    'remaining_ooip_stb': round(remaining_ooip, 0),
+                    'remaining_ooip_mmbbl': round(remaining_ooip / 1_000_000, 3),
+                    'recovery_factor_pct': round(recovery_factor, 2),
+                    'cum_oil_365d_stb': round(cum_oil_365, 0),
+                    'formation_volume_factor': bo,
+                    'bo_source': bo_source,
+                    'inputs': {
+                        'area_acres': area_acres,
+                        'thickness_ft': thickness_ft,
+                        'porosity_frac': porosity_frac,
+                        'water_sat_frac': water_sat_frac,
+                    }
+                }
+                print(f"[BASELINE {simulation_id}] OOIP={ooip_stb/1e6:.2f} MMbbl  "
+                      f"Remaining={remaining_ooip/1e6:.2f} MMbbl  RF={recovery_factor:.1f}%",
+                      file=sys.stderr, flush=True)
+            else:
+                ooip_data = {'note': 'OOIP not computed: area, thickness, or porosity not provided'}
+        except Exception as ooip_err:
+            ooip_data = {'error': str(ooip_err)}
+            print(f"[BASELINE {simulation_id}] OOIP calc failed: {ooip_err}", file=sys.stderr)
+        # ─────────────────────────────────────────────────────────────────────
+
         results_data = {
-            'oil_predicted': float(np.random.uniform(50000, 100000)),
-            'water_predicted': float(np.random.uniform(10000, 50000)),
-            'gas_predicted': float(np.random.uniform(500000, 1000000)),
-            'pressure_predicted': float(np.random.uniform(1000, 3000)),
-            'data_source': data_source
+            'oil_predicted': oil_predicted,
+            'water_predicted': water_predicted,
+            'gas_predicted': gas_predicted,
+            'pressure_predicted': pressure_predicted,
+            'data_source': data_source,
+            'ooip': ooip_data,
         }
+
         
         # Mark as completed
         simulation.refresh_from_db()
@@ -453,15 +541,503 @@ class SensitivityDatasetPreviewView(APIView):
 
 
 class SensitivitySimulationView(APIView):
-    """Run a quick sensitivity analysis using a lightweight internal runner.
+    """
+    Nodal analysis sensitivity runner.
 
-    This is a minimal merge of the New Project simulation endpoint into XCAPE.
-    The implementation returns deterministic mock results suitable for embedding
-    and testing; replace with the full nodal analysis integration when ready.
+    Physics:
+      IPR (Vogel): Pwf = PR * [0.125 * (-1 + sqrt(81 - 80*(q/qmax)))]
+        At q=0  -> Pwf = PR  (reservoir pressure)
+        At q=qmax -> Pwf = 0  (AOF condition)
+
+      VLP (Hagedorn-Brown simplified):
+        Pwf = WHP + dP_hydrostatic + dP_friction
+        dP_hydrostatic = 0.052 * rho_mix_lbgal * TVD_ft   (psi)
+        dP_friction    = f(q, tubing, rho_mix)
+
+      Operating point: scipy.optimize.brentq finds q where IPR_Pwf(q) == VLP_Pwf(q)
     """
     permission_classes = [permissions.IsAuthenticated]
 
     def post(self, request):
+        import math
+        from scipy.optimize import brentq
+        from api.serializers import SensitivityRequestSerializer
+
+        # Log incoming payload for debugging intermittent 400 responses
+        logger.debug("Sensitivity simulate received payload: %s", request.data)
+
+        serializer = SensitivityRequestSerializer(data=request.data)
+        try:
+            serializer.is_valid(raise_exception=True)
+        except Exception as e:
+            logger.warning("Sensitivity simulate validation failed: %s; payload=%s", str(e), request.data)
+            # If serializer contains errors, log them too for diagnosis
+            try:
+                logger.warning("Serializer errors: %s", getattr(serializer, 'errors', None))
+            except Exception:
+                pass
+            raise
+
+        payload = cast(dict[str, Any], serializer.validated_data)
+
+        gas_min = payload['gas_injection_min_mmscfpd']
+        gas_max = payload['gas_injection_max_mmscfpd']
+        gas_step = payload['gas_injection_step_mmscfpd']
+        gas_steps = int(max(1, round((gas_max - gas_min) / gas_step) + 1)) if gas_step > 0 else 1
+        wellhead_cases = payload['wellhead_pressure_psig_values']
+        watercut_cases = payload['water_cut_fraction_values']
+        ds = payload['dataset_row']
+
+        # ── Well & fluid properties ──────────────────────────────────────────
+        PR   = float(ds['reservoir_pressure_psia'])   # static reservoir pressure
+        PB   = float(ds['bubble_point_pressure_psia'])
+        PI   = float(ds['productivity_index_bpd_psi'])
+        TVD  = float(ds['true_vertical_depth_ft'])
+        TID  = float(ds['tubing_id_in'])              # tubing internal diameter
+        WC   = float(ds['water_cut_fraction'])
+        API  = float(ds['oil_api'])
+        GOR  = float(ds['gas_oil_ratio_scf_stb'])
+        T_F  = float(ds['temperature_f'])
+
+        # Oil density from API gravity  (lb/gal)
+        rho_oil_lbgal  = 141.5 / (API + 131.5) * 8.337   # SG * 8.337 lb/gal
+        rho_water_lbgal = 8.55                             # brine ≈ 1.026 SG
+
+        # ── PVT Match ────────────────────────────────────────────────────────
+        x_standing = 0.0125 * API - 0.00091 * T_F
+        rs_at_pb = 0.65 * ((PB / 18.2 + 1.4) * 10**x_standing)**1.2048
+        rs_match_factor = GOR / max(1.0, rs_at_pb)
+
+        # ── Vogel AOF and qmax ───────────────────────────────────────────────
+        # Standard Vogel q_max: qmax = PI * PR / 1.8
+        # If PR < PB (saturated): use composite IPR
+        if PR <= PB:
+            q_max_vogel = PI * PR / 1.8
+        else:
+            # Composite IPR (Klins & Clark)
+            q_linear_at_pb = PI * (PR - PB)
+            q_vogel_component = PI * PB / 1.8
+            q_max_vogel = q_linear_at_pb + q_vogel_component
+
+        def vogel_pwf(q_oil: float) -> float:
+            """Return Pwf (psia) from Vogel IPR for a given flow rate q_oil (bopd)."""
+            q_oil = max(0.0, q_oil)
+            q_liquid = q_oil / max(1e-5, 1.0 - WC)
+            qmax = max(1.0, q_max_vogel)
+            ratio = min(q_liquid / qmax, 1.0)
+            if PR <= PB:
+                # Fully saturated — direct Vogel
+                disc = max(0.0, 81.0 - 80.0 * ratio)
+                pwf = PR * 0.125 * (-1.0 + math.sqrt(disc))
+            else:
+                # Composite: above PB linear, below PB Vogel
+                q_pb = PI * (PR - PB)
+                if q_liquid <= q_pb:
+                    # Linear (subsaturated) region
+                    pwf = PR - q_liquid / PI
+                else:
+                    # Vogel (saturated) region below bubble point
+                    q_vogel = q_liquid - q_pb
+                    qmax_vogel_part = max(1.0, PI * PB / 1.8)
+                    rv = min(q_vogel / qmax_vogel_part, 1.0)
+                    disc = max(0.0, 81.0 - 80.0 * rv)
+                    pwf = PB * 0.125 * (-1.0 + math.sqrt(disc))
+            return max(0.0, pwf)
+
+        def beggs_brill_gradient(p_psia: float, t_f: float, q_oil_bpd: float, wc_frac: float, gi_rate_mmscfd: float, d_in: float):
+            p_psia = max(14.7, p_psia)
+            q_oil_bpd = max(0.1, q_oil_bpd)
+            wc_frac = min(0.99, max(0.0, wc_frac))
+            
+            sg_o = 141.5 / (API + 131.5)
+            sg_g = 0.65
+            sg_w = 1.02
+            
+            x = 0.0125 * API - 0.00091 * t_f
+            rs_uncorrected = sg_g * ((p_psia / 18.2 + 1.4) * 10**x)**1.2048
+            rs = rs_uncorrected * rs_match_factor
+            rs = min(rs, GOR)
+            
+            f_bo = rs * (sg_g / sg_o)**0.5 + 1.25 * t_f
+            bo = 0.9759 + 0.00012 * f_bo**1.2
+            bw = 1.0
+            
+            z_visc = 3.0324 - 0.02023 * API
+            y_visc = 10**z_visc
+            x_visc = y_visc * (t_f)**(-1.163)
+            mu_od = max(0.1, 10**x_visc - 1.0)
+            A_visc = 10.715 * (rs + 100.0)**(-0.515)
+            B_visc = 5.44 * (rs + 150.0)**(-0.338)
+            mu_o = A_visc * (mu_od)**B_visc
+            mu_w, mu_g = 0.5, 0.015
+            
+            T_c = 169.2 + 349.5 * sg_g - 74.0 * sg_g**2
+            P_c = 756.8 - 131.0 * sg_g - 3.6 * sg_g**2
+            T_pr = (t_f + 460.0) / T_c
+            P_pr = p_psia / P_c
+            z = 1.0 - (3.52 * P_pr) / (10**(0.9813 * T_pr)) + (0.274 * P_pr**2) / (10**(0.8157 * T_pr))
+            z = max(0.2, z)
+            bg = 0.02827 * z * (t_f + 460.0) / p_psia
+            
+            q_o_insitu = q_oil_bpd * bo * 5.615 / 86400.0
+            q_w_insitu = (q_oil_bpd / (1.0 - wc_frac) * wc_frac) * bw * 5.615 / 86400.0
+            q_L = q_o_insitu + q_w_insitu
+            
+            total_gas = q_oil_bpd * GOR + gi_rate_mmscfd * 1e6
+            # Explicit bubble-point handling: if local pressure is above bubble point,
+            # treat all gas as dissolved (no free gas) to avoid unphysical free-gas at high pressure
+            try:
+                if p_psia >= PB:
+                    free_gas = 0.0
+                else:
+                    free_gas = max(0.0, total_gas - q_oil_bpd * rs)
+            except Exception:
+                # Fallback conservative behavior
+                free_gas = max(0.0, total_gas - q_oil_bpd * rs)
+            q_g_insitu = free_gas * bg / 86400.0
+            
+            area = math.pi * (d_in / 12.0 / 2.0)**2
+            v_sl = q_L / area
+            v_sg = q_g_insitu / area
+            v_m = v_sl + v_sg
+            
+            rho_o = (62.4 * sg_o + rs * 0.0764 * sg_g / 5.615) / bo
+            rho_w = 62.4 * sg_w
+            rho_g = 0.0764 * sg_g * p_psia / 14.7 * 520.0 / (t_f + 460.0) / z
+            
+            f_L = max(1e-5, min(1.0, q_L / max(1e-5, q_L + q_g_insitu)))
+            rho_L = rho_o * (q_o_insitu / q_L) + rho_w * (q_w_insitu / q_L)
+            rho_ns = rho_L * f_L + rho_g * (1.0 - f_L)
+            
+            if f_L >= 0.999:
+                H_L = 1.0
+                rho_slip = rho_L
+                
+                mu_L = mu_o * (q_o_insitu / q_L) + mu_w * (q_w_insitu / q_L)
+                Re_ns = 1488.0 * rho_L * v_m * (d_in / 12.0) / max(1e-5, mu_L)
+                
+                eps = 0.0006
+                relative_roughness = eps / d_in
+                f_ns = 0.25 / (math.log10(max(1e-5, (relative_roughness / 3.7) + (5.74 / max(1.0, Re_ns)**0.9))))**2
+                f_tp = f_ns
+                
+                dp_dz_hydro = rho_slip / 144.0
+                dp_dz_fric = (f_tp * rho_L * v_m**2) / (2.0 * 32.174 * (d_in / 12.0) * 144.0)
+                return dp_dz_hydro, dp_dz_fric, rho_slip, H_L
+            
+            N_fr = v_m**2 / (32.174 * (d_in / 12.0))
+            L1 = 316.0 * f_L**0.302
+            L2 = 0.0009252 * f_L**-2.4684
+            L3 = 0.10 * f_L**-1.4516
+            L4 = 0.5 * f_L**-6.738
+            
+            if (f_L < 0.01 and N_fr < L1) or (f_L >= 0.01 and N_fr < L2):
+                regime = "segregated"
+            elif f_L >= 0.01 and L2 <= N_fr <= L3:
+                regime = "transition"
+            elif (0.01 <= f_L < 0.4 and L3 < N_fr <= L1) or (f_L >= 0.4 and L3 < N_fr <= L4):
+                regime = "intermittent"
+            else:
+                regime = "distributed"
+                
+            def calc_holdup(reg, fl, nfr):
+                if reg == "segregated":
+                    a, b, c = 0.98, 0.4846, 0.0868
+                elif reg == "intermittent":
+                    a, b, c = 0.845, 0.5351, 0.0173
+                else:
+                    a, b, c = 1.065, 0.5824, 0.0609
+                return max(fl, min(1.0, a * fl**b / max(1e-5, nfr**c)))
+                
+            if regime == "transition":
+                A = (L3 - N_fr) / max(1e-5, L3 - L2)
+                hl0 = A * calc_holdup("segregated", f_L, N_fr) + (1.0 - A) * calc_holdup("intermittent", f_L, N_fr)
+            else:
+                hl0 = calc_holdup(regime, f_L, N_fr)
+                
+            if regime == "segregated":
+                e, f, g, h = 0.011, -3.768, 3.539, -1.614
+            elif regime == "intermittent":
+                e, f, g, h = 2.96, 0.305, -0.4473, 0.0978
+            else:
+                e, f, g, h = 0.0, 0.0, 0.0, 0.0
+                
+            N_lv = 1.938 * v_sl * (rho_L / 62.4)**0.25
+            
+            C = 0.0
+            if regime in ["segregated", "intermittent"]:
+                C = (1.0 - f_L) * math.log(max(1e-5, e * f_L**f * N_lv**g * N_fr**h))
+                C = max(0.0, C)
+                
+            angle_rad = math.radians(1.8 * 90.0)
+            phi = 1.0 + C * (math.sin(angle_rad) - 0.333 * math.sin(angle_rad)**3)
+            H_L = max(f_L, min(1.0, hl0 * phi))
+            
+            rho_slip = rho_L * H_L + rho_g * (1.0 - H_L)
+            
+            mu_L = mu_o * (q_o_insitu / q_L) + mu_w * (q_w_insitu / q_L)
+            mu_ns = mu_L * f_L + mu_g * (1.0 - f_L)
+            Re_ns = 1488.0 * rho_ns * v_m * (d_in / 12.0) / max(1e-5, mu_ns)
+            
+            eps = 0.0006
+            relative_roughness = eps / d_in
+            f_ns = 0.25 / (math.log10(max(1e-5, (relative_roughness / 3.7) + (5.74 / max(1.0, Re_ns)**0.9))))**2
+            
+            y = f_L / max(1e-5, H_L**2)
+            if 1.0 < y < 1.2:
+                S = math.log(2.2 * y - 1.2)
+            else:
+                lny = math.log(max(1e-5, y))
+                S = lny / (-0.0523 + 3.182 * lny - 0.8725 * lny**2 + 0.01853 * lny**4)
+            
+            S = min(10.0, max(-10.0, S))
+            # Reduce sensitivity of the two-phase friction multiplier to avoid extreme penalties
+            f_tp = f_ns * math.exp(0.5 * S)
+            
+            dp_dz_hydro = rho_slip / 144.0
+            # Use slip-based mixture density for friction term to reflect reduced column mass
+            dp_dz_fric = (f_tp * rho_slip * v_m**2) / (2.0 * 32.174 * (d_in / 12.0) * 144.0)
+            
+            return dp_dz_hydro, dp_dz_fric, rho_slip, H_L
+
+        def vlp_bhp(q: float, whp_psig: float, wc_frac: float, gi_rate_mmscfd: float) -> float:
+            q = max(0.0, q)
+            if q == 0:
+                rho_mix = rho_oil_lbgal * (1.0 - wc_frac) + rho_water_lbgal * wc_frac
+                return (whp_psig + 14.7) + 0.052 * rho_mix * TVD
+            
+            p_curr = whp_psig + 14.7
+            n_steps = 50
+            dz = TVD / n_steps
+            T_surface = max(80.0, T_F - (TVD / 100.0) * 1.5)
+            dT_dz = (T_F - T_surface) / TVD
+            
+            for i in range(n_steps):
+                depth1 = i * dz
+                T1 = T_surface + dT_dz * depth1
+                dp_hyd1, dp_fric1, _, _ = beggs_brill_gradient(p_curr, T1, q, wc_frac, gi_rate_mmscfd, TID)
+                
+                p_guess = p_curr + (dp_hyd1 + dp_fric1) * dz
+                depth2 = (i + 1) * dz
+                T2 = T_surface + dT_dz * depth2
+                
+                dp_hyd2, dp_fric2, _, _ = beggs_brill_gradient(p_guess, T2, q, wc_frac, gi_rate_mmscfd, TID)
+                dp_hyd = 0.5 * (dp_hyd1 + dp_hyd2)
+                dp_fric = 0.5 * (dp_fric1 + dp_fric2)
+                p_curr += (dp_hyd + dp_fric) * dz
+            return p_curr
+
+        def find_operating_point(whp_psig: float, wc_frac: float,
+                                 gi_rate_mmscfd: float) -> dict:
+            """
+            Find q where vogel_pwf(q) == vlp_bhp(q).
+            Uses brentq root-finding on f(q) = IPR_Pwf(q) - VLP_Pwf(q).
+            """
+            def residual(q):
+                return vogel_pwf(q) - vlp_bhp(q, whp_psig, wc_frac, gi_rate_mmscfd)
+
+            # Check if well can flow at all:
+            # At q=0, IPR gives PR; VLP gives WHP + hydrostatic (no flow).
+            # Well can flow only if IPR(q_tiny) > VLP(q_tiny).
+            q_tiny = 1.0
+            ipr_at_tiny = vogel_pwf(q_tiny)
+            vlp_at_tiny = vlp_bhp(q_tiny, whp_psig, wc_frac, gi_rate_mmscfd)
+
+            if ipr_at_tiny <= vlp_at_tiny:
+                # VLP always above IPR — dead well
+                return {
+                    'oil_rate_bpd': 0.0,
+                    'liquid_rate_bpd': 0.0,
+                    'pwf_psia': round(vlp_at_tiny, 1),
+                    'bottomhole_pressure_psia': round(vlp_at_tiny, 1),
+                    'pressure_mismatch_psia': round(vlp_at_tiny - ipr_at_tiny, 1),
+                    'well_status': 'dead',
+                    'note': 'VLP exceeds IPR — well cannot flow naturally at this WHP/WC combination.',
+                }
+
+            # Find the bracket: residual changes sign between q_tiny and q_max
+            q_high = q_max_vogel * 0.999
+            # Make sure we have a sign change
+            try:
+                q_solution = brentq(residual, q_tiny, q_high, xtol=0.1, rtol=1e-4, maxiter=100)
+            except ValueError:
+                # No sign change found — well is barely flowing; use q at min residual
+                q_solution = q_tiny
+
+            q_solution = max(0.0, q_solution)
+            pwf_solution = vogel_pwf(q_solution)
+            vlp_solution = vlp_bhp(q_solution, whp_psig, wc_frac, gi_rate_mmscfd)
+            liquid_rate = q_solution / max(0.01, 1.0 - wc_frac)  # gross liquid
+
+            return {
+                'oil_rate_bpd': round(q_solution, 1),
+                'liquid_rate_bpd': round(liquid_rate, 1),
+                'pwf_psia': round(pwf_solution, 1),
+                'bottomhole_pressure_psia': round(vlp_solution, 1),
+                'pressure_mismatch_psia': round(abs(pwf_solution - vlp_solution), 2),
+                'well_status': 'flowing',
+            }
+
+        def build_ipr_curve(gi_rate_mmscfd: float, wc_frac: float, n_points: int = 20):
+            """
+            Build IPR curve: Pwf (psia) vs q (bopd).
+            At q=0 → Pwf = PR.  At q=qmax → Pwf ≈ 0.
+            """
+            points = []
+            for i in range(n_points + 1):
+                q = q_max_vogel * i / n_points
+                pwf = vogel_pwf(q)
+                points.append({'oil_rate_bpd': round(q, 1), 'pwf_psia': round(pwf, 1)})
+            return points
+
+        def build_vlp_curve(whp_psig: float, wc_frac: float,
+                            gi_rate_mmscfd: float, n_points: int = 20):
+            """
+            Build VLP curve: BHP (psia) vs q (bopd).
+            At q=0 → BHP = WHP + hydrostatic (no friction, but full static head).
+            As q increases → BHP increases due to friction.
+            """
+            points = []
+            for i in range(n_points + 1):
+                q = q_max_vogel * i / n_points
+                bhp = vlp_bhp(q, whp_psig, wc_frac, gi_rate_mmscfd)
+                points.append({'oil_rate_bpd': round(q, 1), 'pwf_psia': round(bhp, 1)})
+            return points
+
+        def build_pressure_profile(whp_psig: float, wc_frac: float,
+                                   q_bopd: float, gi_rate_mmscfd: float):
+            profile = []
+            p_curr = whp_psig + 14.7
+            n_steps = 50
+            dz = TVD / n_steps
+            T_surface = max(80.0, T_F - (TVD / 100.0) * 1.5)
+            dT_dz = (T_F - T_surface) / TVD
+            
+            if q_bopd <= 0:
+                rho_mix_lbft3 = (rho_oil_lbgal * (1.0 - wc_frac) + rho_water_lbgal * wc_frac) * 7.48
+                hl = 1.0
+            else:
+                _, _, rho_mix_lbft3, hl = beggs_brill_gradient(p_curr, T_surface, q_bopd, wc_frac, gi_rate_mmscfd, TID)
+                
+            profile.append({
+                'depth_ft': 0,
+                'pressure_psia': round(p_curr, 1),
+                'mixture_density_lbft3': round(rho_mix_lbft3, 2),
+                'liquid_holdup': round(hl, 3),
+            })
+            
+            for i in range(1, n_steps + 1):
+                depth = i * dz
+                if q_bopd <= 0:
+                    dp = 0.052 * (rho_mix_lbft3 / 7.48) * dz
+                    p_curr += dp
+                else:
+                    depth1 = (i - 1) * dz
+                    T1 = T_surface + dT_dz * depth1
+                    dp_hyd1, dp_fric1, rho_mix_lbft3, hl = beggs_brill_gradient(p_curr, T1, q_bopd, wc_frac, gi_rate_mmscfd, TID)
+                    
+                    p_guess = p_curr + (dp_hyd1 + dp_fric1) * dz
+                    depth2 = i * dz
+                    T2 = T_surface + dT_dz * depth2
+                    
+                    dp_hyd2, dp_fric2, _, _ = beggs_brill_gradient(p_guess, T2, q_bopd, wc_frac, gi_rate_mmscfd, TID)
+                    dp_hyd = 0.5 * (dp_hyd1 + dp_hyd2)
+                    dp_fric = 0.5 * (dp_fric1 + dp_fric2)
+                    p_curr += (dp_hyd + dp_fric) * dz
+                    
+                profile.append({
+                    'depth_ft': round(depth, 0),
+                    'pressure_psia': round(p_curr, 1),
+                    'mixture_density_lbft3': round(rho_mix_lbft3, 2),
+                    'liquid_holdup': round(hl, 3),
+                })
+            return profile
+
+        # ── Build all scenarios ──────────────────────────────────────────────
+        total_cases = gas_steps * len(wellhead_cases) * len(watercut_cases)
+        results = {
+            'total_cases': total_cases,
+            'gas_steps': gas_steps,
+            'wellhead_cases': len(wellhead_cases),
+            'watercut_cases': len(watercut_cases),
+            'cases_preview': [],
+            'scenarios': [],
+            'gas_rates_mmscfpd': [round(gas_min + i * gas_step, 3) for i in range(gas_steps)],
+        }
+
+        for step_index in range(gas_steps):
+            gi = round(min(gas_max, gas_min + step_index * gas_step), 3)
+            for whp in wellhead_cases:
+                for wc in watercut_cases:
+                    op = find_operating_point(whp, wc, gi)
+                    q = op['oil_rate_bpd']
+                    scenario = {
+                        'gas_injection_mmscfpd': gi,
+                        'wellhead_pressure_psig': whp,
+                        'water_cut_fraction': wc,
+                        'operating_point': op,
+                        'ipr_curve': build_ipr_curve(gi, wc),
+                        'vlp_curve': build_vlp_curve(whp, wc, gi),
+                        'pressure_profile': build_pressure_profile(whp, wc, q, gi),
+                    }
+                    results['scenarios'].append(scenario)
+                    if len(results['cases_preview']) < 8:
+                        results['cases_preview'].append({
+                            'gas_injection_mmscfpd': gi,
+                            'wellhead_pressure_psig': whp,
+                            'water_cut_fraction': wc,
+                            'predicted_oil_bbl': q,
+                        })
+
+        flowing = [s for s in results['scenarios'] if s['operating_point']['well_status'] == 'flowing']
+        if flowing:
+            results['best_case'] = max(flowing, key=lambda s: s['operating_point']['oil_rate_bpd'])
+        else:
+            results['best_case'] = results['scenarios'][0]
+        results['scenario_count'] = total_cases
+        results['well_name'] = ds.get('well_name', 'Unknown Well')
+        results['nodal_physics'] = {
+            'q_max_aof_bopd': round(q_max_vogel, 1),
+            'reservoir_pressure_psia': PR,
+            'bubble_point_psia': PB,
+            'tvd_ft': TVD,
+        }
+
+        # Performance envelope
+        agg: dict = {}
+        for s in results['scenarios']:
+            gi = s['gas_injection_mmscfpd']
+            agg.setdefault(gi, []).append(s['operating_point']['oil_rate_bpd'])
+        results['performance_envelope'] = [
+            {
+                'gas_injection_mmscfpd': gi,
+                'oil_rate_min_bpd': round(min(rates), 1),
+                'oil_rate_avg_bpd': round(sum(rates) / len(rates), 1),
+                'oil_rate_max_bpd': round(max(rates), 1),
+                'scenario_count': len(rates),
+            }
+            for gi, rates in sorted(agg.items())
+        ]
+
+        # Persist SimulationRun record (non-fatal)
+        try:
+            SimulationRun.objects.create(
+                user=request.user,
+                name=f"Sensitivity run ({request.user.username})",
+                matching_type='sensitivity',
+                status='completed',
+                progress=100,
+                initial_pressure=PR,
+                porosity=0.0,
+                permeability=0.0,
+                water_saturation=WC * 100,
+                results_data=results,
+            )
+        except Exception:
+            pass
+
+        return Response(results)
+
         from api.serializers import SensitivityRequestSerializer
 
         serializer = SensitivityRequestSerializer(data=request.data)
@@ -722,9 +1298,14 @@ class DatasetViewSet(viewsets.ModelViewSet):
                     parsed = json.loads(raw)
 
                     # Heuristic: treat as reservoir model if it contains common keys
-                    if isinstance(parsed, dict) and any(k in parsed for k in (
-                            'rock_properties', 'fluid_properties', 'grid', 'cells',
-                            'initial_pressure', 'porosity', 'permeability', 'water_saturation')):
+                    reservoir_model_keys = {
+                        'rock_properties', 'fluid_properties', 'grid', 'cells',
+                        'initial_pressure', 'porosity', 'permeability', 'water_saturation',
+                        'reservoir_geometry', 'rock_mechanics', 'reservoir', 'well',
+                        'formation_volume_factor', 'oil_viscosity', 'temperature', 'depth',
+                        'drainage_area', 'net_pay_thickness', 'thickness', 'area',
+                    }
+                    if isinstance(parsed, dict) and any(k in parsed for k in reservoir_model_keys):
                         dataset.production_data = {'reservoir_model': parsed}
                         dataset.save(update_fields=['production_data'])
                         print(f"[DATASET] Parsed JSON reservoir model; stored in production_data['reservoir_model']",
@@ -1771,6 +2352,57 @@ class SimulationRunViewSet(viewsets.ModelViewSet):
             simulation.status = 'completed'
             simulation.match_quality = float(enkf_result.get('best_quality', 0))
             simulation.progress = 100
+
+            # ── OOIP Calculation for EnKF ────────────────────────────────────
+            ooip_data = {}
+            try:
+                area_acres   = safe_float(simulation.area, 0.0)
+                thickness_ft = safe_float(simulation.thickness, 0.0)
+                porosity_frac = safe_float(simulation.porosity, 0.0)
+                if porosity_frac > 1.0:
+                    porosity_frac /= 100.0
+                water_sat_frac = safe_float(simulation.water_saturation, 0.0)
+                if water_sat_frac > 1.0:
+                    water_sat_frac /= 100.0
+
+                bo = safe_float(simulation.oil_formation_volume_factor, 0.0)
+                bo_source = 'user'
+                if bo <= 0:
+                    temp_f    = safe_float(simulation.temperature, 180.0)
+                    press_psi = safe_float(simulation.initial_pressure, 3000.0)
+                    bo = _standing_bo(temp_f, press_psi)
+                    bo_source = "Standing's correlation"
+
+                if area_acres > 0 and thickness_ft > 0 and porosity_frac > 0:
+                    ooip_stb = _calculate_ooip(area_acres, thickness_ft, porosity_frac,
+                                               water_sat_frac, bo)
+                    # Forecast cumulative production over 365 days (85% efficiency factor)
+                    cum_oil_365 = oil_predicted * 365 * 0.85
+                    remaining_ooip = max(0.0, ooip_stb - cum_oil_365)
+                    recovery_factor = min(100.0, (cum_oil_365 / ooip_stb) * 100) if ooip_stb > 0 else 0.0
+
+                    ooip_data = {
+                        'ooip_stb': round(ooip_stb, 0),
+                        'ooip_mmbbl': round(ooip_stb / 1_000_000, 3),
+                        'remaining_ooip_stb': round(remaining_ooip, 0),
+                        'remaining_ooip_mmbbl': round(remaining_ooip / 1_000_000, 3),
+                        'recovery_factor_pct': round(recovery_factor, 2),
+                        'cum_oil_365d_stb': round(cum_oil_365, 0),
+                        'formation_volume_factor': bo,
+                        'bo_source': bo_source,
+                        'inputs': {
+                            'area_acres': area_acres,
+                            'thickness_ft': thickness_ft,
+                            'porosity_frac': porosity_frac,
+                            'water_sat_frac': water_sat_frac,
+                        }
+                    }
+                else:
+                    ooip_data = {'note': 'OOIP not computed: area, thickness, or porosity not provided'}
+            except Exception as ooip_err:
+                ooip_data = {'error': str(ooip_err)}
+            # ─────────────────────────────────────────────────────────────────
+
             simulation.results_data = {
                 'enkf_result': convert_to_serializable({k: v for k, v in enkf_result.items() if k != 'final_ensemble'}),
                 'prior_ensemble': convert_to_serializable(prior_ensemble),
@@ -1780,6 +2412,7 @@ class SimulationRunViewSet(viewsets.ModelViewSet):
                 'water_predicted': water_predicted,
                 'gas_predicted': gas_predicted,
                 'pressure_predicted': pressure_predicted,
+                'ooip': ooip_data,
             }
             simulation.completed_at = timezone.now()
             if simulation.started_at:

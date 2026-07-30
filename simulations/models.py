@@ -36,6 +36,7 @@ class SimulationRun(models.Model):
     MATCHING_TYPE_CHOICES = [
         ('baseline', 'Baseline Matching'),
         ('enkf', 'Ensemble Kalman Filter (EnKF)'),
+        ('sensitivity', 'Sensitivity Analysis'),
     ]
     
     STATUS_CHOICES = [
@@ -57,11 +58,21 @@ class SimulationRun(models.Model):
     matching_type = models.CharField(max_length=20, choices=MATCHING_TYPE_CHOICES)
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending')
     
-    # Parameters
-    initial_pressure = models.FloatField(help_text="bar")
+    # Parameters (oilfield units)
+    initial_pressure = models.FloatField(help_text="psi")
     porosity = models.FloatField(help_text="%")
     permeability = models.FloatField(help_text="mD")
     water_saturation = models.FloatField(help_text="%")
+    
+    # Extended reservoir parameters (optional — used for OOIP)
+    oil_viscosity = models.FloatField(null=True, blank=True, help_text="cp")
+    rock_compressibility = models.FloatField(null=True, blank=True, help_text="1/psi")
+    thickness = models.FloatField(null=True, blank=True, help_text="ft - net pay thickness")
+    area = models.FloatField(null=True, blank=True, help_text="acres - drainage area")
+    oil_formation_volume_factor = models.FloatField(null=True, blank=True, help_text="RB/STB")
+    oil_initial_saturation = models.FloatField(null=True, blank=True, help_text="fraction 0-1")
+    temperature = models.FloatField(null=True, blank=True, help_text="°F")
+    depth = models.FloatField(null=True, blank=True, help_text="ft")
     
     # Progress tracking
     progress = models.IntegerField(default=0, help_text="0-100 percentage")

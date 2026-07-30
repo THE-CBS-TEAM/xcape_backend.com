@@ -193,6 +193,9 @@ class SimulationRunDetailSerializer(serializers.ModelSerializer):
         model = SimulationRun
         fields = ['id', 'name', 'description', 'matching_type', 'status', 'dataset',
                   'initial_pressure', 'porosity', 'permeability', 'water_saturation',
+                  'oil_viscosity', 'rock_compressibility', 'thickness', 'area',
+                  'oil_formation_volume_factor', 'oil_initial_saturation',
+                  'temperature', 'depth',
                   'progress', 'match_quality', 'error_message', 'results_data',
                   'created_at', 'started_at', 'completed_at', 'duration_seconds',
                   'forecasts']
@@ -209,22 +212,21 @@ class SimulationRunCreateSerializer(serializers.ModelSerializer):
     class Meta:
         model = SimulationRun
         fields = ['id', 'name', 'description', 'matching_type', 'dataset',
-                  'initial_pressure', 'porosity', 'permeability', 'water_saturation', 'created_at']
+                  'initial_pressure', 'porosity', 'permeability', 'water_saturation',
+                  'oil_viscosity', 'rock_compressibility', 'thickness', 'area',
+                  'oil_formation_volume_factor', 'oil_initial_saturation',
+                  'temperature', 'depth', 'created_at']
         read_only_fields = ['id', 'created_at']
     
     def create(self, validated_data):
         request = self.context['request']
         validated_data['user'] = request.user
 
-        # If a dataset with a parsed reservoir model was attached, and the
-        # user did not supply initial reservoir parameters, try to infer
-        # sensible defaults from the uploaded model JSON.
+        # Try to infer sensible defaults from the uploaded model JSON
+        # for any fields that are missing in the user's explicit input.
         dataset = validated_data.get('dataset')
-        missing_params = any(validated_data.get(k) in (None, '') for k in (
-            'initial_pressure', 'porosity', 'permeability', 'water_saturation'
-        ))
 
-        if dataset and missing_params:
+        if dataset:
             try:
                 prod = getattr(dataset, 'production_data', {}) or {}
                 # Prefer explicitly stored reservoir_model, otherwise fall back
@@ -242,17 +244,39 @@ class SimulationRunCreateSerializer(serializers.ModelSerializer):
                     por = rm.get('porosity')
                     perm = rm.get('permeability')
                     wsat = rm.get('water_saturation') or rm.get('waterSat') or rm.get('sw')
+                    temp = rm.get('temperature')
+                    depth = rm.get('depth')
+                    area = rm.get('area')
+                    thick = rm.get('thickness') or rm.get('net_pay_thickness')
+                    fvf = rm.get('formation_volume_factor') or rm.get('oil_formation_volume_factor')
+                    comp = rm.get('rock_compressibility')
+                    visc = rm.get('oil_viscosity')
+                    isat = rm.get('oil_initial_sat') or rm.get('oil_initial_saturation')
 
                     # Check nested sections
                     if 'fluid_properties' in rm and isinstance(rm['fluid_properties'], dict):
                         fp = rm['fluid_properties']
                         ip = ip or fp.get('initial_pressure') or fp.get('pressure')
                         wsat = wsat or fp.get('water_saturation') or fp.get('waterSat')
+                        fvf = fvf or fp.get('formation_volume_factor')
+                        visc = visc or fp.get('oil_viscosity')
+                        isat = isat or fp.get('oil_initial_sat')
 
                     if 'rock_properties' in rm and isinstance(rm['rock_properties'], dict):
                         rp = rm['rock_properties']
                         por = por or rp.get('porosity') or rp.get('poro')
                         perm = perm or rp.get('permeability') or rp.get('perm')
+                        temp = temp or rp.get('temperature')
+                        depth = depth or rp.get('depth')
+
+                    if 'rock_mechanics' in rm and isinstance(rm['rock_mechanics'], dict):
+                        rmec = rm['rock_mechanics']
+                        comp = comp or rmec.get('rock_compressibility')
+
+                    if 'reservoir_geometry' in rm and isinstance(rm['reservoir_geometry'], dict):
+                        rg = rm['reservoir_geometry']
+                        area = area or rg.get('area') or rg.get('drainage_area')
+                        thick = thick or rg.get('thickness') or rg.get('net_pay_thickness')
 
                     # If porosity/permeability are arrays (per-cell), take the mean
                     try:
@@ -282,7 +306,7 @@ class SimulationRunCreateSerializer(serializers.ModelSerializer):
 
                     # Set values only when missing and when we have a valid numeric value
                     def set_if_missing(key, value):
-                        if value is None:
+                        if value is None or value == '':
                             return
                         if validated_data.get(key) in (None, ''):
                             try:
@@ -294,12 +318,19 @@ class SimulationRunCreateSerializer(serializers.ModelSerializer):
                     set_if_missing('porosity', por)
                     set_if_missing('permeability', perm)
                     set_if_missing('water_saturation', wsat)
+                    set_if_missing('temperature', temp)
+                    set_if_missing('depth', depth)
+                    set_if_missing('area', area)
+                    set_if_missing('thickness', thick)
+                    set_if_missing('oil_formation_volume_factor', fvf)
+                    set_if_missing('rock_compressibility', comp)
+                    set_if_missing('oil_viscosity', visc)
+                    set_if_missing('oil_initial_saturation', isat)
             except Exception:
                 # Fail silently: fallback to whatever the user provided or defaults
                 pass
 
         return super().create(validated_data)
-
 
 class ForecastSerializer(serializers.ModelSerializer):
     class Meta:
@@ -356,7 +387,7 @@ class SensitivityRequestSerializer(serializers.Serializer):
     dataset_row = WellDatasetRowSerializer()
     gas_injection_min_mmscfpd = serializers.FloatField(min_value=0)
     gas_injection_max_mmscfpd = serializers.FloatField(min_value=0)
-    gas_injection_step_mmscfpd = serializers.FloatField(min_value=0.05)
+    gas_injection_step_mmscfpd = serializers.FloatField(min_value=0.0)
     wellhead_pressure_psig_values = serializers.ListField(
         child=serializers.FloatField(min_value=0), allow_empty=False
     )
