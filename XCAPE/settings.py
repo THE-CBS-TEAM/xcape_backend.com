@@ -34,6 +34,7 @@ INSTALLED_APPS = [
     'users.apps.UsersConfig',
     'api.apps.ApiConfig',
     'simulations.apps.SimulationsConfig',
+    'corsheaders',
 ]
 
 MIDDLEWARE = [
