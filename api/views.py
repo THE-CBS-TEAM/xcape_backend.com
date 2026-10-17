@@ -501,6 +501,18 @@ class DashboardViewSet(viewsets.ViewSet):
 
 
 # ============ Sensitivity Analysis Compatibility Endpoints ============
+class HealthCheckView(APIView):
+    """General application health endpoint used by Render and deployment checks."""
+    permission_classes = [permissions.AllowAny]
+
+    def get(self, request):
+        return Response({
+            'status': 'ok',
+            'service': 'xcape-api',
+            'environment': 'production' if not settings.DEBUG else 'development',
+        }, status=status.HTTP_200_OK)
+
+
 class SensitivityHealthView(APIView):
     """Simple health endpoint for embedded sensitivity app"""
     permission_classes = [permissions.AllowAny]
