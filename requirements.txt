@@ -28,6 +28,7 @@ gunicorn>=21.2.0
 whitenoise>=6.6.0
 daphne
 channels
+django-cors-headers
 
 # Linting/Formatting (optional for development)
 black>=24.0.0
