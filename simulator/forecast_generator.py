@@ -25,7 +25,8 @@ class ForecastGenerator:
         forward_model_fn,
         forecast_type: str = 'prior',
         forecast_period_days: int = 365,
-        forecast_date: Optional[str] = None
+        forecast_date: Optional[str] = None,
+        progress_callback=None
     ) -> Dict:
         """
         Generate forecast from ensemble parameters
@@ -59,6 +60,8 @@ class ForecastGenerator:
             except Exception as e:
                 logger.warning(f"Forward model failed for ensemble member {i}: {e}")
                 print(f"[FORECAST] Member {i}/{len(ensemble_params)}: FAILED - {e}", file=__import__('sys').stderr, flush=True)
+            if progress_callback:
+                progress_callback((i + 1) / len(ensemble_params) * 100)
         
         if not ensemble_results:
             return {'status': 'failed', 'error': 'No successful forward model runs'}

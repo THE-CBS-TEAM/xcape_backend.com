@@ -1279,11 +1279,65 @@ class SimulationRunViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['post'])
     def run_enkf_with_forecasts(self, request, pk=None):
         """Run complete EnKF pipeline with prior and posterior forecasts"""
+        import threading
+        from django.db import close_old_connections
+
         import sys
         sys.stderr.write(f"\n\n{'='*80}\n[EnKF ENDPOINT] FUNCTION CALLED FOR SIMULATION {pk}\n{'='*80}\n")
         sys.stderr.flush()
-        
-        simulation = self.get_object()
+
+        is_background_task = request.data.get('_background_task', False)
+        if not is_background_task:
+            simulation = self.get_object()
+            if simulation.status == 'running':
+                return Response({'error': 'This simulation is already running'},
+                                status=status.HTTP_409_CONFLICT)
+
+            simulation.status = 'running'
+            simulation.progress = 0
+            simulation.current_step = 0
+            simulation.started_at = timezone.now()
+            simulation.error_message = ''
+            simulation.save(update_fields=[
+                'status', 'progress', 'current_step', 'started_at', 'error_message'
+            ])
+
+            task_data = request.data.copy()
+            task_data['_background_task'] = True
+            simulation_id = simulation.pk
+            user_id = request.user.pk
+
+            def run_in_background():
+                close_old_connections()
+                try:
+                    user = User.objects.get(pk=user_id)
+                    background_request = type('BackgroundRequest', (), {
+                        'data': task_data,
+                        'user': user,
+                    })()
+                    self.run_enkf_with_forecasts(background_request, pk=simulation_id)
+                except Exception:
+                    logger.exception('Background EnKF task failed for simulation %s', simulation_id)
+                    SimulationRun.objects.filter(pk=simulation_id, user_id=user_id).update(
+                        status='failed',
+                        error_message='The EnKF background task failed. Check backend logs.',
+                        completed_at=timezone.now(),
+                    )
+                finally:
+                    close_old_connections()
+
+            threading.Thread(
+                target=run_in_background,
+                name=f'enkf-simulation-{simulation_id}',
+                daemon=True,
+            ).start()
+
+            return Response({
+                'message': 'EnKF run accepted',
+                'simulation': SimulationRunDetailSerializer(simulation).data,
+            }, status=status.HTTP_202_ACCEPTED)
+
+        simulation = SimulationRun.objects.get(pk=pk, user=request.user)
         
         # DEBUG: Log simulation dataset status
         print(f"\n[EnKF START] ===== SIMULATION {simulation.id} ===== ", file=sys.stderr, flush=True)
@@ -1522,7 +1576,8 @@ class SimulationRunViewSet(viewsets.ModelViewSet):
             # Run EnKF
             def progress_cb(progress, msg):
                 print(f"[EnKF] Progress {progress}%: {msg}", file=sys.stderr, flush=True)
-                simulation.progress = int(progress)
+                simulation.status = 'running'
+                simulation.progress = 5 + int(progress * 0.7)
                 simulation.current_step += 1
                 simulation.save()
                 
@@ -1605,6 +1660,10 @@ class SimulationRunViewSet(viewsets.ModelViewSet):
             if enkf_result.get('status') != 'completed':
                 error_msg = enkf_result.get('error', 'Unknown error')
                 print(f"[EnKF] Failed: {error_msg}", file=sys.stderr, flush=True)
+                simulation.status = 'failed'
+                simulation.error_message = error_msg
+                simulation.completed_at = timezone.now()
+                simulation.save(update_fields=['status', 'error_message', 'completed_at'])
                 return Response({'error': f'EnKF run failed: {error_msg}'}, 
                               status=status.HTTP_500_INTERNAL_SERVER_ERROR)
             
@@ -1628,6 +1687,25 @@ class SimulationRunViewSet(viewsets.ModelViewSet):
             
             # Generate PRIOR forecast (before EnKF)
             fg = ForecastGenerator()
+
+            def forecast_progress(start, span, label):
+                def update(progress):
+                    simulation.status = 'running'
+                    simulation.progress = min(99, start + int(progress * span / 100))
+                    simulation.current_step += 1
+                    simulation.save(update_fields=['status', 'progress', 'current_step'])
+                    try:
+                        async_to_sync(broadcast_simulation_progress)(
+                            simulation.id,
+                            f'{label}: {progress:.0f}%',
+                            iteration=simulation.current_step,
+                            status='forecasting',
+                        )
+                    except Exception as ws_error:
+                        print(f"[WebSocket] Error broadcasting forecast progress: {ws_error}",
+                              file=sys.stderr, flush=True)
+                return update
+
             # Ensure ensemble members are dictionaries (consistent param names)
             def _array_to_param_dict(arr):
                 try:
@@ -1658,7 +1736,8 @@ class SimulationRunViewSet(viewsets.ModelViewSet):
                 prior_ensemble_list,
                 forward_model_fn,
                 'prior',
-                forecast_period_days
+                forecast_period_days,
+                progress_callback=forecast_progress(75, 12, 'Prior forecast'),
             )
             
             # Generate POSTERIOR forecast (after EnKF)
@@ -1671,7 +1750,8 @@ class SimulationRunViewSet(viewsets.ModelViewSet):
                 posterior_ensemble_list_dicts,
                 forward_model_fn,
                 'posterior',
-                forecast_period_days
+                forecast_period_days,
+                progress_callback=forecast_progress(87, 12, 'Posterior forecast'),
             )
             
             # Persist both forecasts
@@ -1825,7 +1905,8 @@ class SimulationRunViewSet(viewsets.ModelViewSet):
             logger.error(f"EnKF pipeline failed: {e}")
             simulation.status = 'failed'
             simulation.error_message = str(e)
-            simulation.save()
+            simulation.completed_at = timezone.now()
+            simulation.save(update_fields=['status', 'error_message', 'completed_at'])
             return Response({'error': str(e)}, 
                           status=status.HTTP_500_INTERNAL_SERVER_ERROR)
     

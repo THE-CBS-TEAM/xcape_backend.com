@@ -159,12 +159,11 @@ class EnKFFilter:
         Returns:
             Updated ensemble
         """
-        N = self.ensemble_size  # Ensemble size
+        N = ensemble.shape[0]
         M = ensemble.shape[1]   # Number of parameters
         
         # Concatenate all observations into single vector
         obs_vec = np.concatenate([observations[k] for k in observations.keys()])
-        H_obs = len(obs_vec)  # Total number of observations
         
         # Build simulated observation matrix (H x N)
         H_matrix = []
@@ -212,12 +211,16 @@ class EnKFFilter:
             error_std = measurement_error.get(k, 0.1)
             error_values.extend([error_std] * n_obs_type)
         
-        R = np.diag(np.array(error_values) ** 2)  # H x H covariance matrix
-        
-        # Kalman gain: K = X_anom * Y_anom.T * (Y_anom * Y_anom.T + R)^{-1}
+        error_variances = np.array(error_values, dtype=float) ** 2
+
         try:
-            denominator = Y_anom @ Y_anom.T + R
-            K_gain = (X_anom @ Y_anom.T) @ np.linalg.inv(denominator)
+            weighted_y_anom = Y_anom / error_variances[:, np.newaxis]
+            ensemble_system = np.eye(N) + Y_anom.T @ weighted_y_anom
+            gain_projection = np.linalg.solve(
+                ensemble_system,
+                Y_anom.T / error_variances[np.newaxis, :]
+            )
+            K_gain = X_anom @ gain_projection
             
             # Update each ensemble member
             updated_ensemble = ensemble.copy()

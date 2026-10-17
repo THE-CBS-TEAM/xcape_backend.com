@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: xcape-api
+    env: python
+    plan: free
+    buildCommand: "pip install -r requirements.txt && python manage.py migrate --noinput && python manage.py collectstatic --noinput"
+    startCommand: "daphne -b 0.0.0.0 -p $PORT XCAPE.asgi:application"
+    envVars:
+      - key: DJANGO_SETTINGS_MODULE
+        value: XCAPE.settings
+      - key: DJANGO_DEBUG
+        value: "False"
+      - key: DJANGO_SECRET_KEY
+        generateValue: true
+      - key: DATABASE_URL
+        sync: false

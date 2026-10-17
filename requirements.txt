@@ -30,3 +30,4 @@ whitenoise
 black
 flake8
 isort
+daphne
