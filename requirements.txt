@@ -31,3 +31,4 @@ black
 flake8
 isort
 daphne
+channels>=4.0,<5.0
