@@ -47,6 +47,7 @@ MIDDLEWARE = [
     'django.contrib.auth.middleware.AuthenticationMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
+    
 ]
 
 ROOT_URLCONF = 'XCAPE.urls'
@@ -114,7 +115,7 @@ CORS_ALLOWED_ORIGINS = [
 ]
 CORS_ALLOW_CREDENTIALS = True
 
-DEFAULT_CSRF = 'http://localhost:3000,http://localhost:5173,http://127.0.0.1:3000,http://127.0.0.1:5173'
+DEFAULT_CSRF = 'http://localhost:3000,http://localhost:5173,http://127.0.0.1:3000,http://127.0.0.1:5173,https://xcape-backend-com.onrender.com'
 CSRF_TRUSTED_ORIGINS = [
     origin.strip() for origin in os.getenv('CSRF_TRUSTED_ORIGINS', DEFAULT_CSRF).split(',') if origin.strip()
 ]
