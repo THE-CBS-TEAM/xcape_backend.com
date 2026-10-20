@@ -4,6 +4,7 @@ from api.views import (
     AuthenticationViewSet, UserViewSet, DashboardViewSet,
     DatasetViewSet, ForecastViewSet, SimulationRunViewSet,
     AlgorithmDefinitionViewSet,
+    WorkspaceViewSet,
     HealthCheckView, SensitivityHealthView, SensitivityDatasetPreviewView, SensitivitySimulationView,
 )
 
@@ -13,6 +14,7 @@ router.register(r'users', UserViewSet, basename='user')
 router.register(r'dashboard', DashboardViewSet, basename='dashboard')
 router.register(r'datasets', DatasetViewSet, basename='dataset')
 router.register(r'algorithms', AlgorithmDefinitionViewSet, basename='algorithm')
+router.register(r'workspaces', WorkspaceViewSet, basename='workspace')
 router.register(r'simulations', SimulationRunViewSet, basename='simulation')
 router.register(r'forecasts', ForecastViewSet, basename='forecast')
 

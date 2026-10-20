@@ -1,6 +1,6 @@
 from rest_framework import serializers
 from django.contrib.auth import get_user_model
-from users.models import UserActivityLog, CustomUser
+from users.models import UserActivityLog, CustomUser, Workspace, WorkspaceMember, WorkspaceInvitation, get_user_workspaces
 from simulations.models import Dataset, SimulationRun, Forecast, SimulationStatistics, AlgorithmDefinition
 import sys
 
@@ -10,6 +10,7 @@ User = get_user_model()
 # ============ User Serializers ============
 
 class UserRegistrationSerializer(serializers.ModelSerializer):
+    username = serializers.CharField(max_length=150)
     password = serializers.CharField(write_only=True, min_length=8)
     password2 = serializers.CharField(write_only=True, min_length=8)
     
@@ -18,21 +19,43 @@ class UserRegistrationSerializer(serializers.ModelSerializer):
         fields = ['username', 'email', 'first_name', 'last_name', 'password', 'password2',
                   'institution', 'department']
     
+    def validate_username(self, value):
+        val = value.strip()
+        if len(val) < 3:
+            raise serializers.ValidationError("Username must be at least 3 characters long.")
+        return val
+
     def validate(self, data):
         if data['password'] != data.pop('password2'):
             raise serializers.ValidationError({"password": "Passwords do not match."})
         return data
     
     def create(self, validated_data):
+        raw_username = validated_data['username'].strip()
+        first_name = validated_data.get('first_name', '').strip()
+        last_name = validated_data.get('last_name', '').strip()
+        if not first_name and ' ' in raw_username:
+            parts = raw_username.split(' ', 1)
+            first_name = parts[0]
+            last_name = parts[1] if len(parts) > 1 else ''
+
         user = CustomUser.objects.create_user(
-            username=validated_data['username'],
+            username=raw_username,
             email=validated_data['email'],
-            first_name=validated_data.get('first_name', ''),
-            last_name=validated_data.get('last_name', ''),
+            first_name=first_name,
+            last_name=last_name,
             password=validated_data['password'],
             institution=validated_data.get('institution', ''),
             department=validated_data.get('department', ''),
         )
+        # Automatically create personal workspace for user
+        ws_name = f"{user.first_name.strip() or user.username}'s Workspace"
+        ws = Workspace.objects.create(
+            name=ws_name,
+            owner=user,
+            description=f"Primary collaborative workspace for {user.username}"
+        )
+        WorkspaceMember.objects.create(workspace=ws, user=user, role='owner')
         return user
 
 
@@ -67,6 +90,77 @@ class UserDetailSerializer(serializers.ModelSerializer):
     def get_recent_simulations(self, obj):
         recent = obj.simulation_runs.all()[:5]
         return SimulationRunListSerializer(recent, many=True).data
+
+
+class WorkspaceMemberSerializer(serializers.ModelSerializer):
+    user_id = serializers.IntegerField(source='user.id', read_only=True)
+    username = serializers.CharField(source='user.username', read_only=True)
+    full_name = serializers.SerializerMethodField()
+    email = serializers.EmailField(source='user.email', read_only=True)
+    role_display = serializers.CharField(source='get_role_display', read_only=True)
+
+    class Meta:
+        model = WorkspaceMember
+        fields = ['id', 'user_id', 'username', 'full_name', 'email', 'role', 'role_display', 'joined_at']
+        read_only_fields = ['id', 'joined_at']
+
+    def get_full_name(self, obj):
+        return obj.user.get_full_name().strip() or obj.user.username
+
+
+class WorkspaceInvitationSerializer(serializers.ModelSerializer):
+    role_display = serializers.CharField(source='get_role_display', read_only=True)
+    invited_by_name = serializers.SerializerMethodField()
+    is_valid = serializers.SerializerMethodField()
+
+    class Meta:
+        model = WorkspaceInvitation
+        fields = ['id', 'workspace', 'invited_by', 'invited_by_name', 'role', 'role_display', 'token', 'is_used', 'is_valid', 'created_at', 'expires_at']
+        read_only_fields = ['id', 'token', 'is_used', 'created_at']
+
+    def get_invited_by_name(self, obj):
+        return obj.invited_by.get_full_name().strip() or obj.invited_by.username
+
+    def get_is_valid(self, obj):
+        return obj.is_valid()
+
+
+class WorkspaceSerializer(serializers.ModelSerializer):
+    owner_name = serializers.SerializerMethodField()
+    owner_email = serializers.EmailField(source='owner.email', read_only=True)
+    current_user_role = serializers.SerializerMethodField()
+    members = WorkspaceMemberSerializer(many=True, read_only=True)
+    member_count = serializers.SerializerMethodField()
+    invitations = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Workspace
+        fields = ['id', 'name', 'description', 'owner', 'owner_name', 'owner_email',
+                  'current_user_role', 'members', 'member_count', 'invitations', 'created_at', 'updated_at']
+        read_only_fields = ['id', 'owner', 'created_at', 'updated_at']
+
+    def get_owner_name(self, obj):
+        return obj.owner.get_full_name().strip() or obj.owner.username
+
+    def get_current_user_role(self, obj):
+        request = self.context.get('request')
+        if not request or not request.user or not request.user.is_authenticated:
+            return None
+        membership = obj.members.filter(user=request.user).first()
+        return membership.role if membership else ('owner' if obj.owner == request.user else None)
+
+    def get_member_count(self, obj):
+        return obj.members.count()
+
+    def get_invitations(self, obj):
+        request = self.context.get('request')
+        if not request or not request.user or not request.user.is_authenticated:
+            return []
+        membership = obj.members.filter(user=request.user).first()
+        if obj.owner == request.user or (membership and membership.role in ('owner', 'admin')):
+            invs = obj.invitations.filter(is_used=False).order_by('-created_at')[:20]
+            return WorkspaceInvitationSerializer(invs, many=True).data
+        return []
 
 
 class UserActivityLogSerializer(serializers.ModelSerializer):
@@ -223,6 +317,11 @@ class SimulationRunDetailSerializer(serializers.ModelSerializer):
 
 
 class SimulationRunCreateSerializer(serializers.ModelSerializer):
+    initial_pressure = serializers.FloatField(required=False, allow_null=True)
+    porosity = serializers.FloatField(required=False, allow_null=True)
+    permeability = serializers.FloatField(required=False, allow_null=True)
+    water_saturation = serializers.FloatField(required=False, allow_null=True)
+
     class Meta:
         model = SimulationRun
         fields = ['id', 'name', 'description', 'matching_type', 'dataset', 'algorithm_definition', 'algorithm_config',
@@ -345,6 +444,29 @@ class SimulationRunCreateSerializer(serializers.ModelSerializer):
             except Exception:
                 # Fail silently: fallback to whatever the user provided or defaults
                 pass
+
+        # Fallback values from algorithm_config['parameters_to_estimate'] if available
+        algo_config = validated_data.get('algorithm_config') or {}
+        params_to_est = algo_config.get('parameters_to_estimate') or []
+        for p in params_to_est:
+            name = p.get('name')
+            init_val = p.get('initial_guess')
+            if name and init_val is not None:
+                if validated_data.get(name) in (None, '', 0, 0.0):
+                    try:
+                        validated_data[name] = float(init_val)
+                    except Exception:
+                        pass
+
+        # Physical defaults if still missing (satisfies non-null database fields)
+        if validated_data.get('initial_pressure') in (None, ''):
+            validated_data['initial_pressure'] = 3000.0
+        if validated_data.get('porosity') in (None, ''):
+            validated_data['porosity'] = 20.0
+        if validated_data.get('permeability') in (None, ''):
+            validated_data['permeability'] = 100.0
+        if validated_data.get('water_saturation') in (None, ''):
+            validated_data['water_saturation'] = 25.0
 
         return super().create(validated_data)
 

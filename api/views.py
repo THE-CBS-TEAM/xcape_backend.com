@@ -29,6 +29,9 @@ from api.serializers import (
     UserDetailSerializer,
     UserRegistrationSerializer,
     UserSerializer,
+    WorkspaceSerializer,
+    WorkspaceMemberSerializer,
+    WorkspaceInvitationSerializer,
 )
 from django.conf import settings
 from api.ws_utils import broadcast_simulation_complete, broadcast_simulation_error, broadcast_simulation_progress
@@ -40,7 +43,9 @@ from simulator.equation_engine import DynamicEquationSmoother
 from simulator.forecast_generator import ForecastGenerator
 from simulator.interpretation import interpret_simulation_results
 from simulations.models import Dataset, Forecast, SimulationRun, SimulationStatistics, AlgorithmDefinition
-from users.models import CustomUser, UserActivityLog
+from users.models import CustomUser, UserActivityLog, Workspace, WorkspaceMember, WorkspaceInvitation, get_user_workspaces
+from django.shortcuts import get_object_or_404
+from rest_framework.permissions import IsAuthenticated, AllowAny
 
 User = get_user_model()
 
@@ -338,6 +343,8 @@ class AuthenticationViewSet(viewsets.ViewSet):
     def login(self, request):
         """Login with username/email and password"""
         username = request.data.get('username')
+        if isinstance(username, str):
+            username = username.strip()
         password = request.data.get('password')
         
         if not username or not password:
@@ -2591,3 +2598,253 @@ class ForecastViewSet(viewsets.ModelViewSet):
         }
 
         return Response(data)
+
+
+# ============ Workspace Views ============
+
+class WorkspaceViewSet(viewsets.ModelViewSet):
+    """Collaborative workspace management, member roles, and one-time invitation links"""
+    serializer_class = WorkspaceSerializer
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        user = self.request.user
+        if not user.is_authenticated:
+            return Workspace.objects.none()
+        return Workspace.objects.filter(
+            Q(owner=user) | Q(members__user=user)
+        ).distinct().prefetch_related('members__user', 'invitations')
+
+    def perform_create(self, serializer):
+        workspace = serializer.save(owner=self.request.user)
+        WorkspaceMember.objects.create(
+            workspace=workspace,
+            user=self.request.user,
+            role='owner'
+        )
+
+    @action(detail=False, methods=['get'])
+    def my_workspaces(self, request):
+        """Return all workspaces for the current user, ensuring at least one default exists"""
+        memberships = get_user_workspaces(request.user)
+        workspaces = [m.workspace for m in memberships]
+        serializer = self.get_serializer(workspaces, many=True)
+        return Response(serializer.data)
+
+    @action(detail=False, methods=['post'])
+    def invite(self, request):
+        """Generate a one-time invitation link for a team member with a specified role"""
+        workspace_id = request.data.get('workspace_id')
+        role = request.data.get('role', 'engineer')
+        
+        if role not in ('admin', 'engineer', 'viewer'):
+            role = 'engineer'
+
+        user = request.user
+        workspace = None
+        if workspace_id:
+            try:
+                workspace = Workspace.objects.get(id=workspace_id)
+            except Workspace.DoesNotExist:
+                return Response({"error": "Workspace not found."}, status=status.HTTP_404_NOT_FOUND)
+        else:
+            workspace = Workspace.objects.filter(owner=user).first()
+            if not workspace:
+                m = WorkspaceMember.objects.filter(user=user, role__in=['owner', 'admin']).first()
+                workspace = m.workspace if m else None
+
+        if not workspace:
+            memberships = get_user_workspaces(user)
+            workspace = memberships.first().workspace
+
+        # Permission check
+        is_owner = (workspace.owner == user)
+        is_admin = WorkspaceMember.objects.filter(workspace=workspace, user=user, role__in=['owner', 'admin']).exists()
+        if not (is_owner or is_admin or user.is_staff):
+            return Response(
+                {"error": "Permission denied. Only Workspace Owners or Admins can generate invite links."},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        expires_at = timezone.now() + timedelta(days=14)
+        invitation = WorkspaceInvitation.objects.create(
+            workspace=workspace,
+            invited_by=user,
+            role=role,
+            expires_at=expires_at
+        )
+
+        UserActivityLog.objects.create(
+            user=user,
+            activity_type='workspace_invite_created',
+            description=f"Generated invite link for role '{role}' in '{workspace.name}'",
+            ip_address=self.get_client_ip(request)
+        )
+
+        return Response({
+            "token": str(invitation.token),
+            "role": invitation.role,
+            "role_display": invitation.get_role_display(),
+            "workspace_id": workspace.id,
+            "workspace_name": workspace.name,
+            "expires_at": invitation.expires_at,
+            "invite_path": f"/join?token={invitation.token}",
+        }, status=status.HTTP_201_CREATED)
+
+    @action(detail=False, methods=['get'], permission_classes=[AllowAny], url_path=r'invitation/(?P<token>[^/.]+)')
+    def inspect_invitation(self, request, token=None):
+        """Public endpoint to inspect an invitation token before joining or registering"""
+        try:
+            invitation = WorkspaceInvitation.objects.select_related('workspace', 'workspace__owner', 'invited_by').get(token=token)
+        except Exception:
+            return Response({"valid": False, "error": "Invalid invitation link."}, status=status.HTTP_404_NOT_FOUND)
+
+        if invitation.is_used:
+            return Response({
+                "valid": False,
+                "error": "This invitation link has already been used.",
+                "workspace_name": invitation.workspace.name
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        if not invitation.is_valid():
+            return Response({
+                "valid": False,
+                "error": "This invitation link has expired.",
+                "workspace_name": invitation.workspace.name
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        return Response({
+            "valid": True,
+            "token": str(invitation.token),
+            "workspace_id": invitation.workspace.id,
+            "workspace_name": invitation.workspace.name,
+            "workspace_description": invitation.workspace.description,
+            "owner_name": invitation.workspace.owner.get_full_name().strip() or invitation.workspace.owner.username,
+            "invited_by": invitation.invited_by.get_full_name().strip() or invitation.invited_by.username,
+            "role": invitation.role,
+            "role_display": invitation.get_role_display(),
+            "expires_at": invitation.expires_at,
+        })
+
+    @action(detail=False, methods=['post'])
+    def accept_invite(self, request):
+        """Accept an invitation for an already-logged-in user"""
+        token_str = request.data.get('token')
+        if not token_str:
+            return Response({"error": "Invitation token is required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            invitation = WorkspaceInvitation.objects.select_related('workspace').get(token=token_str)
+        except Exception:
+            return Response({"error": "Invalid invitation token."}, status=status.HTTP_404_NOT_FOUND)
+
+        if not invitation.is_valid():
+            return Response({"error": "This invitation is either expired or already used."}, status=status.HTTP_400_BAD_REQUEST)
+
+        user = request.user
+        membership, created = WorkspaceMember.objects.get_or_create(
+            workspace=invitation.workspace,
+            user=user,
+            defaults={'role': invitation.role}
+        )
+        if not created and membership.role != 'owner':
+            membership.role = invitation.role
+            membership.save()
+
+        invitation.is_used = True
+        invitation.used_by = user
+        invitation.save()
+
+        UserActivityLog.objects.create(
+            user=user,
+            activity_type='workspace_joined',
+            description=f"Joined workspace '{invitation.workspace.name}' as '{invitation.role}'",
+            ip_address=self.get_client_ip(request)
+        )
+
+        return Response({
+            "success": True,
+            "message": f"Successfully joined {invitation.workspace.name} as {invitation.get_role_display()}",
+            "workspace_id": invitation.workspace.id,
+            "workspace_name": invitation.workspace.name,
+            "role": invitation.role,
+        })
+
+    @action(detail=False, methods=['post'], permission_classes=[AllowAny])
+    def register_and_join(self, request):
+        """Register a new user from an invite link and immediately add them to the workspace"""
+        token_str = request.data.get('token')
+        if not token_str:
+            return Response({"error": "Invitation token is required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            invitation = WorkspaceInvitation.objects.select_related('workspace').get(token=token_str)
+        except Exception:
+            return Response({"error": "Invalid invitation token."}, status=status.HTTP_404_NOT_FOUND)
+
+        if not invitation.is_valid():
+            return Response({"error": "This invitation is either expired or already used."}, status=status.HTTP_400_BAD_REQUEST)
+
+        reg_serializer = UserRegistrationSerializer(data=request.data)
+        if not reg_serializer.is_valid():
+            return Response(reg_serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        user = reg_serializer.save()
+
+        # Add user to invited workspace
+        WorkspaceMember.objects.get_or_create(
+            workspace=invitation.workspace,
+            user=user,
+            defaults={'role': invitation.role}
+        )
+
+        invitation.is_used = True
+        invitation.used_by = user
+        invitation.save()
+
+        token, _ = Token.objects.get_or_create(user=user)
+        SimulationStatistics.objects.get_or_create(user=user)
+
+        UserActivityLog.objects.create(
+            user=user,
+            activity_type='workspace_joined',
+            description=f"Registered and joined workspace '{invitation.workspace.name}' as '{invitation.role}'",
+            ip_address=self.get_client_ip(request)
+        )
+
+        return Response({
+            "user": UserSerializer(user).data,
+            "token": token.key,
+            "message": f"Welcome! You have successfully joined {invitation.workspace.name}.",
+            "workspace_id": invitation.workspace.id,
+            "workspace_name": invitation.workspace.name,
+            "role": invitation.role,
+        }, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=['post'])
+    def remove_member(self, request, pk=None):
+        """Remove a member from the workspace (owner or admin only)"""
+        workspace = self.get_object()
+        target_user_id = request.data.get('user_id')
+        if not target_user_id:
+            return Response({"error": "user_id is required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        user = request.user
+        is_owner = (workspace.owner == user)
+        is_admin = WorkspaceMember.objects.filter(workspace=workspace, user=user, role='admin').exists()
+        if not (is_owner or is_admin or user.is_staff):
+            return Response({"error": "Permission denied."}, status=status.HTTP_403_FORBIDDEN)
+
+        if str(workspace.owner.id) == str(target_user_id):
+            return Response({"error": "Cannot remove the owner of the workspace."}, status=status.HTTP_400_BAD_REQUEST)
+
+        deleted, _ = WorkspaceMember.objects.filter(workspace=workspace, user_id=target_user_id).delete()
+        if deleted:
+            return Response({"success": True, "message": "Member removed."})
+        return Response({"error": "Member not found."}, status=status.HTTP_404_NOT_FOUND)
+
+    def get_client_ip(self, request):
+        x_forwarded_for = request.META.get('HTTP_X_FORWARDED_FOR')
+        if x_forwarded_for:
+            return x_forwarded_for.split(',')[0].strip()
+        return request.META.get('REMOTE_ADDR')
