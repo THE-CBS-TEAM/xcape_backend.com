@@ -1351,10 +1351,20 @@ class DatasetViewSet(viewsets.ModelViewSet):
 
 class AlgorithmDefinitionViewSet(viewsets.ReadOnlyModelViewSet):
     """API endpoint to list and retrieve active history matching algorithms dynamically"""
-    queryset = AlgorithmDefinition.objects.filter(is_active=True).order_by('-is_default', 'name')
     serializer_class = AlgorithmDefinitionSerializer
     permission_classes = [permissions.AllowAny]
     pagination_class = None
+
+    def get_queryset(self):
+        qs = AlgorithmDefinition.objects.filter(is_active=True).order_by('-is_default', 'name')
+        if not qs.exists():
+            from django.core.management import call_command
+            try:
+                call_command('seed_algorithms')
+                qs = AlgorithmDefinition.objects.filter(is_active=True).order_by('-is_default', 'name')
+            except Exception as e:
+                logger.warning("Could not auto-seed algorithms: %s", e)
+        return qs
 
 
 class SimulationRunViewSet(viewsets.ModelViewSet):

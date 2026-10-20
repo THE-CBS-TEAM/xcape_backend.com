@@ -307,7 +307,7 @@ class SimulationRunDetailSerializer(serializers.ModelSerializer):
                   'temperature', 'depth',
                   'progress', 'match_quality', 'error_message', 'results_data',
                   'created_at', 'started_at', 'completed_at', 'duration_seconds',
-                  'forecasts']
+                  'forecasts', 'workspace']
         read_only_fields = ['id', 'progress', 'match_quality', 'error_message',
                            'results_data', 'created_at', 'started_at', 'completed_at',
                            'duration_seconds']
@@ -351,7 +351,7 @@ class SimulationRunCreateSerializer(serializers.ModelSerializer):
                   'initial_pressure', 'porosity', 'permeability', 'water_saturation',
                   'oil_viscosity', 'rock_compressibility', 'thickness', 'area',
                   'oil_formation_volume_factor', 'oil_initial_saturation',
-                  'temperature', 'depth', 'created_at']
+                  'temperature', 'depth', 'workspace', 'created_at']
         read_only_fields = ['id', 'created_at']
     
     def create(self, validated_data):
