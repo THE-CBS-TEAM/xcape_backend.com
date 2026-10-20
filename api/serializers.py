@@ -308,9 +308,11 @@ class SimulationRunCreateSerializer(serializers.ModelSerializer):
                     def set_if_missing(key, value):
                         if value is None or value == '':
                             return
-                        if validated_data.get(key) in (None, ''):
+                        if validated_data.get(key) in (None, '', 0, 0.0):
                             try:
-                                validated_data[key] = float(value)
+                                v = float(value)
+                                if v > 0:
+                                    validated_data[key] = v
                             except Exception:
                                 pass
 
