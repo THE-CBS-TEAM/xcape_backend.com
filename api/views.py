@@ -537,7 +537,7 @@ class SensitivityHealthView(APIView):
 
 class SensitivityDatasetPreviewView(APIView):
     """Accept a CSV/JSON upload and return a small preview row."""
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [permissions.AllowAny]
     parser_classes = [MultiPartParser, FormParser]
 
     def post(self, request):
@@ -582,7 +582,7 @@ class SensitivitySimulationView(APIView):
 
       Operating point: scipy.optimize.brentq finds q where IPR_Pwf(q) == VLP_Pwf(q)
     """
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [permissions.AllowAny]
 
     def post(self, request):
         import math
@@ -1002,9 +1002,9 @@ class SensitivitySimulationView(APIView):
                         'wellhead_pressure_psig': whp,
                         'water_cut_fraction': wc,
                         'operating_point': op,
-                        'ipr_curve': build_ipr_curve(gi, wc),
-                        'vlp_curve': build_vlp_curve(whp, wc, gi),
-                        'pressure_profile': build_pressure_profile(whp, wc, q, gi),
+                        'ipr_curve': [],
+                        'vlp_curve': [],
+                        'pressure_profile': [],
                     }
                     results['scenarios'].append(scenario)
                     if len(results['cases_preview']) < 8:
@@ -1017,9 +1017,21 @@ class SensitivitySimulationView(APIView):
 
         flowing = [s for s in results['scenarios'] if s['operating_point']['well_status'] == 'flowing']
         if flowing:
-            results['best_case'] = max(flowing, key=lambda s: s['operating_point']['oil_rate_bpd'])
+            best_scenario = max(flowing, key=lambda s: s['operating_point']['oil_rate_bpd'])
         else:
-            results['best_case'] = results['scenarios'][0]
+            best_scenario = results['scenarios'][0]
+
+        # Calculate high-resolution IPR, VLP curves and pressure traverse for the optimum scenario
+        best_gi = best_scenario['gas_injection_mmscfpd']
+        best_whp = best_scenario['wellhead_pressure_psig']
+        best_wc = best_scenario['water_cut_fraction']
+        best_q = best_scenario['operating_point']['oil_rate_bpd']
+
+        best_scenario['ipr_curve'] = build_ipr_curve(best_gi, best_wc)
+        best_scenario['vlp_curve'] = build_vlp_curve(best_whp, best_wc, best_gi)
+        best_scenario['pressure_profile'] = build_pressure_profile(best_whp, best_wc, best_q, best_gi)
+
+        results['best_case'] = best_scenario
         results['scenario_count'] = total_cases
         results['well_name'] = ds.get('well_name', 'Unknown Well')
         results['nodal_physics'] = {
@@ -1045,232 +1057,25 @@ class SensitivitySimulationView(APIView):
             for gi, rates in sorted(agg.items())
         ]
 
-        # Persist SimulationRun record (non-fatal)
-        try:
-            SimulationRun.objects.create(
-                user=request.user,
-                name=f"Sensitivity run ({request.user.username})",
-                matching_type='sensitivity',
-                status='completed',
-                progress=100,
-                initial_pressure=PR,
-                porosity=0.0,
-                permeability=0.0,
-                water_saturation=WC * 100,
-                results_data=results,
-            )
-        except Exception:
-            pass
+        # Persist SimulationRun record if authenticated (non-fatal)
+        if request.user and request.user.is_authenticated:
+            try:
+                SimulationRun.objects.create(
+                    user=request.user,
+                    name=f"Sensitivity run ({request.user.username})",
+                    matching_type='sensitivity',
+                    status='completed',
+                    progress=100,
+                    initial_pressure=PR,
+                    porosity=0.0,
+                    permeability=0.0,
+                    water_saturation=WC * 100,
+                    results_data=results,
+                )
+            except Exception:
+                pass
 
         return Response(results)
-
-        from api.serializers import SensitivityRequestSerializer
-
-        serializer = SensitivityRequestSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        payload = cast(dict[str, Any], serializer.validated_data)
-
-        # Minimal internal runner: compute combinations count and return full scenario profiles
-        gas_min = payload['gas_injection_min_mmscfpd']
-        gas_max = payload['gas_injection_max_mmscfpd']
-        gas_step = payload['gas_injection_step_mmscfpd']
-        gas_steps = int(max(1, (gas_max - gas_min) / gas_step + 1)) if gas_step > 0 else 1
-        wellhead_cases = payload['wellhead_pressure_psig_values']
-        watercut_cases = payload['water_cut_fraction_values']
-        dataset = payload['dataset_row']
-
-        total_cases = gas_steps * len(wellhead_cases) * len(watercut_cases)
-
-        def build_operating_point(whp, wc, gi_rate=0.5):
-            # Enhanced Vogel IPR with proper wellhead pressure dependency
-            pr = dataset['reservoir_pressure_psia']
-            pb = dataset['bubble_point_pressure_psia']
-            pi = dataset['productivity_index_bpd_psi']
-            tvd = dataset['true_vertical_depth_ft']
-            
-            # Calculate bubble point corrected PI
-            pi_corrected = pi * (0.7 if pr < pb else 1.0)
-            
-            # Vogel maximum potential rate at zero drawdown
-            pr_ratio = max(0.1, min(1.0, pr / pb)) if pb > 0 else 1.0
-            vogel_q_max = pi_corrected * pr * (1.9 * pr_ratio - 0.9 * pr_ratio**2)
-            
-            # Skin effect and water cut reduction
-            skin_factor = 1.0 - wc * 0.35 - max(0, (tvd - 5000) / 10000) * 0.15
-            skin_factor = max(0.3, skin_factor)
-            
-            # Gas lift effect
-            glift_factor = 1.0 + (gi_rate / 4.0) * 0.25
-            
-            # Iteratively solve for oil rate and pwf considering tubing pressure drop
-            # This properly models the effect of wellhead pressure on oil rate
-            pwf = pr * 0.7  # Initial guess: pwf at 70% of reservoir pressure
-            oil_rate = 0
-            
-            for iteration in range(5):  # Iterate to convergence
-                # Tubing pressure drop correlates with flow rate and water cut
-                tubing_friction = oil_rate * 0.008 * (1 + wc)
-                
-                # Pwf must be at least whp + tubing drop to surface
-                pwf_min = whp + tubing_friction
-                
-                # Use Vogel to find oil rate at this pwf
-                if pr > 0 and pb > 0:
-                    pwf_ratio = max(0.0, min(1.0, pwf_min / pb))
-                    if pwf_min >= pb:
-                        # Subsaturated (pwf > pb): linear relationship
-                        q_achievable = vogel_q_max * (1.0 - 0.2 * (pwf_min - pb) / (pr - pb))
-                    else:
-                        # Saturated (pwf < pb): Vogel equation
-                        vogel_ratio = 1.9 * pwf_ratio - 0.9 * pwf_ratio**2
-                        q_achievable = vogel_q_max * vogel_ratio
-                else:
-                    q_achievable = vogel_q_max
-                
-                # Apply corrections
-                oil_rate = max(50.0, q_achievable * skin_factor * glift_factor)
-                pwf = pwf_min
-                
-                # Convergence check
-                if iteration > 1 and abs(oil_rate - prev_rate) < 1.0:
-                    break
-                prev_rate = oil_rate
-            
-            oil_rate = round(oil_rate, 2)
-            liquid_rate = round(oil_rate / max(0.15, 1.0 - wc) + (oil_rate * wc * 0.5), 2)
-            pwf = round(pwf, 2)
-            
-            # Bottomhole pressure includes friction
-            friction_loss = oil_rate * 0.008 * (1 + wc)
-            bottomhole = round(pwf + friction_loss, 2)
-            pressure_mismatch = round(abs(bottomhole - pwf), 2)
-            
-            return {
-                'oil_rate_bpd': oil_rate,
-                'liquid_rate_bpd': liquid_rate,
-                'pwf_psia': pwf,
-                'bottomhole_pressure_psia': bottomhole,
-                'pressure_mismatch_psia': pressure_mismatch,
-            }
-
-        def build_ipr_curve(pr, q_target):
-            points = []
-            for ratio in [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]:
-                pwf = round(pr * ratio, 2)
-                q = round(q_target * (ratio / (1.0 + 0.15 * ratio)) if ratio > 0 else 0, 2)
-                points.append({'pwf_psia': pwf, 'oil_rate_bpd': max(0.0, q)})
-            return points
-
-        def build_vlp_curve(whp, q_target):
-            points = []
-            for ratio in [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]:
-                q = round(q_target * ratio, 2)
-                pwf = round(whp + 30.0 + q * 0.03, 2)
-                points.append({'pwf_psia': pwf, 'oil_rate_bpd': q})
-            return points
-
-        def build_pressure_profile(whp, wc):
-            profile = []
-            for depth in [0.0, dataset['true_vertical_depth_ft'] * 0.33, dataset['true_vertical_depth_ft'] * 0.66, float(dataset['true_vertical_depth_ft'])]:
-                density = round(40.0 + wc * 15.0 + depth / 2500.0, 2)
-                pressure = round(whp + 0.433 * density * depth / 1000.0, 2)
-                holdup = round(min(1.0, max(0.2, 0.55 + wc * 0.18 - depth / 15000.0)), 3)
-                profile.append({
-                    'depth_ft': round(depth, 0),
-                    'pressure_psia': pressure,
-                    'mixture_density_lbft3': density,
-                    'liquid_holdup': holdup,
-                })
-            return profile
-
-        results = {
-            'total_cases': total_cases,
-            'gas_steps': gas_steps,
-            'wellhead_cases': len(wellhead_cases),
-            'watercut_cases': len(watercut_cases),
-            'summary': {
-                'expected_oil_gain_percent': 5.0,
-                'expected_gas_used_mmscf': round((gas_min + gas_max) / 2 * gas_steps, 2),
-            },
-            'cases_preview': [],
-            'scenarios': [],
-            'gas_rates_mmscfpd': [round(gas_min + i * gas_step, 3) for i in range(gas_steps)],
-        }
-
-        for step_index in range(gas_steps):
-            gi = round(min(gas_max, gas_min + step_index * gas_step), 3)
-            for gh in wellhead_cases:
-                for wc in watercut_cases:
-                    op = build_operating_point(gh, wc, gi)
-                    scenario = {
-                        'gas_injection_mmscfpd': gi,
-                        'wellhead_pressure_psig': gh,
-                        'water_cut_fraction': wc,
-                        'operating_point': op,
-                        'ipr_curve': build_ipr_curve(op['pwf_psia'], op['oil_rate_bpd'] * 1.1),
-                        'vlp_curve': build_vlp_curve(gh, op['oil_rate_bpd'] * 1.1),
-                        'pressure_profile': build_pressure_profile(gh, wc),
-                    }
-                    results['scenarios'].append(scenario)
-                    if len(results['cases_preview']) < 8:
-                        results['cases_preview'].append({
-                            'gas_injection_mmscfpd': gi,
-                            'wellhead_pressure_psig': gh,
-                            'water_cut_fraction': wc,
-                            'predicted_oil_bbl': round(op['oil_rate_bpd'] * 1.02, 2),
-                        })
-
-        results['best_case'] = max(results['scenarios'], key=lambda s: s['operating_point']['oil_rate_bpd'])
-        results['scenario_count'] = total_cases
-
-        # Add well_name from dataset
-        results['well_name'] = dataset.get('well_name', 'Unknown Well')
-
-        # Aggregate performance data by gas injection rate for smooth performance curves
-        aggregated_performance = {}
-        for scenario in results['scenarios']:
-            gi = scenario['gas_injection_mmscfpd']
-            oil_rate = scenario['operating_point']['oil_rate_bpd']
-            
-            if gi not in aggregated_performance:
-                aggregated_performance[gi] = []
-            aggregated_performance[gi].append(oil_rate)
-        
-        # Convert aggregation to sorted list with statistics
-        results['performance_envelope'] = []
-        for gi in sorted(aggregated_performance.keys()):
-            rates = aggregated_performance[gi]
-            results['performance_envelope'].append({
-                'gas_injection_mmscfpd': gi,
-                'oil_rate_min_bpd': round(min(rates), 2),
-                'oil_rate_avg_bpd': round(sum(rates) / len(rates), 2),
-                'oil_rate_max_bpd': round(max(rates), 2),
-                'scenario_count': len(rates)
-            })
-
-        # Persist a SimulationRun record for traceability (optional)
-        try:
-            sim = SimulationRun.objects.create(
-                user=request.user,
-                name=f"Sensitivity run ({request.user.username})",
-                matching_type='sensitivity',
-                status='completed',
-                progress=100,
-                results_data=results
-            )
-        except Exception:
-            # Non-fatal: ignore DB persistence errors
-            pass
-
-        return Response(results)
-    
-    @action(detail=False, methods=['get'])
-    def statistics(self, request):
-        """Get user statistics"""
-        stats, _ = SimulationStatistics.objects.get_or_create(user=request.user)
-        from api.serializers import SimulationStatisticsSerializer
-        serializer = SimulationStatisticsSerializer(stats)
-        return Response(serializer.data)
 
 
 # ============ Simulation Data Views ============
