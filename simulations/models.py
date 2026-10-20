@@ -27,7 +27,8 @@ class Dataset(models.Model):
         ordering = ['-uploaded_at']
     
     def __str__(self):
-        return f"{self.user.username} - {self.name}"
+        user_name = (self.user.username or self.user.email) if self.user else "Unknown"
+        return f"{user_name} - {self.name}"
 
 
 class SimulationRun(models.Model):
@@ -101,7 +102,8 @@ class SimulationRun(models.Model):
         ]
     
     def __str__(self):
-        return f"{self.user.username} - {self.name} ({self.matching_type})"
+        user_name = (self.user.username or self.user.email) if self.user else "Unknown"
+        return f"#{self.id} {self.name} [{self.get_matching_type_display()}] ({user_name})"
     
     def calculate_duration(self):
         """Calculate simulation duration if completed"""

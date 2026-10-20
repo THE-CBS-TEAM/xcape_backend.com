@@ -17,3 +17,8 @@ urlpatterns = [
 # Serve media files in development
 if settings.DEBUG:
     urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
+
+# Django Admin Panel Custom Branding
+admin.site.site_header = "XCAPE Reservoir Simulation & History Matching Admin"
+admin.site.site_title = "XCAPE Admin Portal"
+admin.site.index_title = "Platform Operations, User Management & Simulation Data"

@@ -204,7 +204,21 @@ def run_baseline_simulation(simulation_id: int):
                       f"Remaining={remaining_ooip/1e6:.2f} MMbbl  RF={recovery_factor:.1f}%",
                       file=sys.stderr, flush=True)
             else:
-                ooip_data = {'note': 'OOIP not computed: area, thickness, or porosity not provided'}
+                missing_fields = []
+                if area_acres <= 0:
+                    missing_fields.append('Drainage Area (acres)')
+                if thickness_ft <= 0:
+                    missing_fields.append('Net Pay Thickness (ft)')
+                if porosity_frac <= 0:
+                    missing_fields.append('Porosity (%)')
+                if water_sat_frac <= 0 and simulation.water_saturation is None:
+                    missing_fields.append('Water Saturation (%)')
+
+                ooip_data = {
+                    'status': 'missing_inputs',
+                    'missing_fields': missing_fields,
+                    'note': f"OOIP and Recovery Factor cannot be calculated. Missing required parameter(s): {', '.join(missing_fields)}." if missing_fields else "OOIP not computed: area, thickness, or porosity not provided"
+                }
         except Exception as ooip_err:
             ooip_data = {'error': str(ooip_err)}
             print(f"[BASELINE {simulation_id}] OOIP calc failed: {ooip_err}", file=sys.stderr)
@@ -2490,7 +2504,21 @@ class SimulationRunViewSet(viewsets.ModelViewSet):
                         }
                     }
                 else:
-                    ooip_data = {'note': 'OOIP not computed: area, thickness, or porosity not provided'}
+                    missing_fields = []
+                if area_acres <= 0:
+                    missing_fields.append('Drainage Area (acres)')
+                if thickness_ft <= 0:
+                    missing_fields.append('Net Pay Thickness (ft)')
+                if porosity_frac <= 0:
+                    missing_fields.append('Porosity (%)')
+                if water_sat_frac <= 0 and simulation.water_saturation is None:
+                    missing_fields.append('Water Saturation (%)')
+
+                ooip_data = {
+                    'status': 'missing_inputs',
+                    'missing_fields': missing_fields,
+                    'note': f"OOIP and Recovery Factor cannot be calculated. Missing required parameter(s): {', '.join(missing_fields)}." if missing_fields else "OOIP not computed: area, thickness, or porosity not provided"
+                }
             except Exception as ooip_err:
                 ooip_data = {'error': str(ooip_err)}
             # ─────────────────────────────────────────────────────────────────

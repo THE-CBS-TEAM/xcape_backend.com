@@ -37,7 +37,9 @@ class CustomUser(AbstractUser):
         verbose_name_plural = 'Users'
     
     def __str__(self):
-        return f"{self.get_full_name()} ({self.email})"
+        full_name = self.get_full_name().strip()
+        name = full_name or self.username or self.email or f"User #{self.pk}"
+        return f"{name} ({self.email})" if self.email and name != self.email else str(name)
 
 
 class UserActivityLog(models.Model):
@@ -48,11 +50,14 @@ class UserActivityLog(models.Model):
         ('logout', 'Logout'),
         ('simulation_start', 'Simulation Started'),
         ('simulation_complete', 'Simulation Completed'),
+        ('simulation_failed', 'Simulation Failed'),
+        ('simulation_interpreted', 'Simulation Interpreted'),
         ('dataset_upload', 'Dataset Uploaded'),
         ('forecast_generated', 'Forecast Generated'),
+        ('settings_update', 'Settings Updated'),
     ]
     
-    user = models.ForeignKey(CustomUser, on_delete=models.CASCADE, related_name='activity_logs')
+    user = models.ForeignKey(CustomUser, on_delete=models.CASCADE, related_name='activity_logs', null=True, blank=True)
     activity_type = models.CharField(max_length=50, choices=ACTIVITY_CHOICES)
     description = models.TextField(blank=True, null=True)
     ip_address = models.GenericIPAddressField(blank=True, null=True)
@@ -61,6 +66,14 @@ class UserActivityLog(models.Model):
     class Meta:
         db_table = 'user_activity_log'
         ordering = ['-timestamp']
+        verbose_name = 'User Activity Log'
+        verbose_name_plural = 'User Activity Logs'
     
     def __str__(self):
-        return f"{self.user.username} - {self.activity_type} - {self.timestamp}"
+        user_name = (
+            self.user.username if (self.user and self.user.username)
+            else (self.user.email if self.user else "Anonymous / System")
+        )
+        act = dict(self.ACTIVITY_CHOICES).get(self.activity_type, self.activity_type)
+        time_str = self.timestamp.strftime('%Y-%m-%d %H:%M') if self.timestamp else ''
+        return f"{user_name} - {act} ({time_str})"
