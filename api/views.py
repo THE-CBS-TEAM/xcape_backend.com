@@ -524,7 +524,7 @@ class DashboardViewSet(viewsets.ViewSet):
             ).order_by('-uploaded_at')[:10]
             recent_forecasts = Forecast.objects.filter(
                 Q(simulation__workspace=active_ws) | (Q(user=user, simulation__workspace__isnull=True) if active_ws.owner == user else Q(pk__in=[]))
-            ).order_by('-created_at')[:10]
+            ).order_by('-generated_at')[:10]
 
             total_sims = SimulationRun.objects.filter(workspace=active_ws).count()
             completed_sims = SimulationRun.objects.filter(workspace=active_ws, status='completed').count()
