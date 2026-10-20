@@ -4,7 +4,7 @@ services:
     env: python
     plan: free
     region: oregon
-    buildCommand: "python -m pip install --upgrade pip && pip install -r requirements.txt && python manage.py migrate --noinput && python manage.py collectstatic --noinput"
+    buildCommand: "python -m pip install --upgrade pip && pip install -r requirements.txt && python manage.py migrate --noinput && python manage.py seed_algorithms && python manage.py collectstatic --noinput"
     startCommand: "daphne -b 0.0.0.0 -p $PORT XCAPE.asgi:application"
     envVars:
       - key: PYTHON_VERSION

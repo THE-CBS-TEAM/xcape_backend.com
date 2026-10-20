@@ -9,6 +9,7 @@ class Dataset(models.Model):
     """User uploaded datasets for simulation"""
     
     user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='datasets')
+    workspace = models.ForeignKey('users.Workspace', on_delete=models.SET_NULL, null=True, blank=True, related_name='datasets', help_text='Workspace this dataset belongs to for team collaboration')
     name = models.CharField(max_length=255)
     description = models.TextField(blank=True, null=True)
     file = models.FileField(upload_to='datasets/')
@@ -118,6 +119,7 @@ class SimulationRun(models.Model):
     user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='simulation_runs')
     dataset = models.ForeignKey(Dataset, on_delete=models.SET_NULL, null=True, blank=True,
                                  related_name='simulations')
+    workspace = models.ForeignKey('users.Workspace', on_delete=models.SET_NULL, null=True, blank=True, related_name='simulation_runs', help_text='Workspace this simulation belongs to for team collaboration')
     algorithm_definition = models.ForeignKey(
         AlgorithmDefinition,
         on_delete=models.SET_NULL,

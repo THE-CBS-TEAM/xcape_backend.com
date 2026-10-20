@@ -284,11 +284,12 @@ class AlgorithmDefinitionSerializer(serializers.ModelSerializer):
 
 class SimulationRunListSerializer(serializers.ModelSerializer):
     dataset_name = serializers.CharField(source='dataset.name', read_only=True)
+    workspace_name = serializers.CharField(source='workspace.name', read_only=True, default='')
     
     class Meta:
         model = SimulationRun
         fields = ['id', 'name', 'matching_type', 'status', 'progress', 'match_quality',
-                  'created_at', 'completed_at', 'dataset_name', 'duration_seconds']
+                  'created_at', 'completed_at', 'dataset_name', 'workspace_name', 'duration_seconds']
         read_only_fields = ['id', 'created_at', 'completed_at']
 
 
@@ -316,11 +317,33 @@ class SimulationRunDetailSerializer(serializers.ModelSerializer):
         return ForecastSerializer(forecasts, many=True).data
 
 
+class TolerantAlgorithmField(serializers.Field):
+    """Tolerantly accept integer PK or slug or None without 400 failure"""
+    def to_internal_value(self, data):
+        if not data:
+            return None
+        try:
+            if isinstance(data, int) or (isinstance(data, str) and str(data).isdigit()):
+                algo = AlgorithmDefinition.objects.filter(pk=int(data)).first()
+                if algo:
+                    return algo
+            algo = AlgorithmDefinition.objects.filter(slug=str(data)).first()
+            if algo:
+                return algo
+            return None
+        except Exception:
+            return None
+
+    def to_representation(self, value):
+        return value.pk if value else None
+
 class SimulationRunCreateSerializer(serializers.ModelSerializer):
     initial_pressure = serializers.FloatField(required=False, allow_null=True)
     porosity = serializers.FloatField(required=False, allow_null=True)
     permeability = serializers.FloatField(required=False, allow_null=True)
     water_saturation = serializers.FloatField(required=False, allow_null=True)
+    algorithm_definition = TolerantAlgorithmField(required=False, allow_null=True)
+    workspace = serializers.PrimaryKeyRelatedField(queryset=Workspace.objects.all(), required=False, allow_null=True)
 
     class Meta:
         model = SimulationRun
@@ -334,6 +357,22 @@ class SimulationRunCreateSerializer(serializers.ModelSerializer):
     def create(self, validated_data):
         request = self.context['request']
         validated_data['user'] = request.user
+
+        # Intelligent algorithm resolution fallback
+        if not validated_data.get('algorithm_definition'):
+            m_type = validated_data.get('matching_type')
+            if m_type:
+                validated_data['algorithm_definition'] = AlgorithmDefinition.objects.filter(slug=m_type).first()
+
+        # Workspace association fallback
+        if not validated_data.get('workspace'):
+            ws_id = request.data.get('workspace_id') or request.headers.get('X-Workspace-Id')
+            if ws_id:
+                validated_data['workspace'] = Workspace.objects.filter(id=ws_id).first()
+            if not validated_data.get('workspace'):
+                mships = get_user_workspaces(request.user)
+                if mships.exists():
+                    validated_data['workspace'] = mships.first().workspace
 
         # Try to infer sensible defaults from the uploaded model JSON
         # for any fields that are missing in the user's explicit input.
