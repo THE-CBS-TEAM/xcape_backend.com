@@ -18,6 +18,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from api.serializers import (
+    AlgorithmDefinitionSerializer,
     DashboardSummarySerializer,
     DatasetSerializer,
     ForecastSerializer,
@@ -32,10 +33,13 @@ from api.serializers import (
 from django.conf import settings
 from api.ws_utils import broadcast_simulation_complete, broadcast_simulation_error, broadcast_simulation_progress
 from simulator.engine import SimulationEngine
+from simulator.base_estimator import BaseEstimator, DEFAULT_PARAMETER_BOUNDS
 from simulator.enkf_filter import EnKFFilter
+from simulator.esmda_smoother import ESMDASmoother
+from simulator.equation_engine import DynamicEquationSmoother
 from simulator.forecast_generator import ForecastGenerator
 from simulator.interpretation import interpret_simulation_results
-from simulations.models import Dataset, Forecast, SimulationRun, SimulationStatistics
+from simulations.models import Dataset, Forecast, SimulationRun, SimulationStatistics, AlgorithmDefinition
 from users.models import CustomUser, UserActivityLog
 
 User = get_user_model()
@@ -1228,6 +1232,11 @@ class DatasetViewSet(viewsets.ModelViewSet):
             import traceback
             traceback.print_exc(file=sys.stderr)
     
+    @action(detail=True, methods=['post'])
+    def run_history_matching(self, request, pk=None):
+        """Unified alias for running multi-algorithm history matching"""
+        return self.run_enkf_with_forecasts(request, pk=pk)
+
     @action(detail=False, methods=['get'])
     def recent(self, request):
         """Get 10 most recent datasets"""
@@ -1266,6 +1275,13 @@ class DatasetViewSet(viewsets.ModelViewSet):
 
         serializer = self.get_serializer(dataset)
         return Response(serializer.data, status=status.HTTP_200_OK)
+
+
+class AlgorithmDefinitionViewSet(viewsets.ReadOnlyModelViewSet):
+    """API endpoint to list and retrieve active history matching algorithms dynamically"""
+    queryset = AlgorithmDefinition.objects.filter(is_active=True).order_by('-is_default', 'name')
+    serializer_class = AlgorithmDefinitionSerializer
+    permission_classes = [permissions.AllowAny]
 
 
 class SimulationRunViewSet(viewsets.ModelViewSet):
@@ -1864,228 +1880,217 @@ class SimulationRunViewSet(viewsets.ModelViewSet):
                       f"decline: {vals[0] - vals[-1]:.0f} ({(vals[-1]/vals[0]*100):.1f}%)",
                       file=sys.stderr, flush=True)
             
-            # Initialize EnKF
-            enkf = EnKFFilter(ensemble_size=ensemble_size)
-            
-            # Create initial ensemble from simulation parameters
-            mean_params = {
-                'initial_pressure': simulation.initial_pressure,
-                'porosity': simulation.porosity,
-                'permeability': simulation.permeability,
-                'water_saturation': simulation.water_saturation,
-            }
-            
-            prior_ensemble = enkf.initialize_ensemble(mean_params)
-            print(f"[EnKF] Prior ensemble shape: {prior_ensemble.shape}", file=sys.stderr, flush=True)
-            
-            # Forward model that uses parameters to generate realistic predictions
-            def forward_model_fn(params):
-                """
-                Forward model that scales production based on reservoir parameters.
-                Uses observed data structure as template and applies parameter-based scaling.
-                
-                Handles both formats:
-                - Dict: {'permeability': 100, 'porosity': 0.2, ...}
-                - Array/List: [permeability, porosity, water_saturation, initial_pressure]
-                """
-                N = len(observed_data['oil'])
-                
-                # Handle both dict and array/list parameter formats
-                if isinstance(params, dict):
-                    # From EnKF - dictionary format
-                    perm = safe_float(params.get('permeability'), simulation.permeability or 100)
-                    poros = safe_float(params.get('porosity'), simulation.porosity or 0.2)
-                    water_sat = safe_float(params.get('water_saturation'), simulation.water_saturation or 0.3)
-                    init_press = safe_float(params.get('initial_pressure'), simulation.initial_pressure or 3000)
-                elif isinstance(params, (list, np.ndarray)):
-                    # From forecast generator - array/list format
-                    # Order: [permeability, porosity, water_saturation, initial_pressure]
-                    try:
-                        perm = float(params[0]) if len(params) > 0 else (simulation.permeability or 100)
-                        poros = float(params[1]) if len(params) > 1 else (simulation.porosity or 0.2)
-                        water_sat = float(params[2]) if len(params) > 2 else (simulation.water_saturation or 0.3)
-                        init_press = float(params[3]) if len(params) > 3 else (simulation.initial_pressure or 3000)
-                    except (TypeError, ValueError, IndexError) as e:
-                        print(f"[EnKF] ERROR parsing array params: {e}, params={params}", file=sys.stderr, flush=True)
-                        perm = simulation.permeability or 100
-                        poros = simulation.porosity or 0.2
-                        water_sat = simulation.water_saturation or 0.3
-                        init_press = simulation.initial_pressure or 3000
+            # ============ DYNAMIC ALGORITHM & PARAMETER SELECTION ============
+            alg_config = simulation.algorithm_config or {}
+            if request.data.get('algorithm_config'):
+                alg_config.update(request.data.get('algorithm_config'))
+
+            alg_slug = (request.data.get('algorithm_type') or alg_config.get('algorithm_type') or simulation.matching_type or 'esmda').lower()
+            print(f"[ENGINE] Selected Algorithm: '{alg_slug}' for simulation {simulation.id}", file=sys.stderr, flush=True)
+
+            # 1. Parameter Space Configuration
+            configured_params = [p for p in alg_config.get('parameters_to_estimate', []) if p.get('enabled', True)]
+            if configured_params:
+                param_names = [p['key'] for p in configured_params]
+                param_bounds = {
+                    p['key']: (
+                        float(p.get('min_bound', DEFAULT_PARAMETER_BOUNDS.get(p['key'], (0.001, 1e6))[0])),
+                        float(p.get('max_bound', DEFAULT_PARAMETER_BOUNDS.get(p['key'], (0.001, 1e6))[1]))
+                    )
+                    for p in configured_params
+                }
+                priors = {
+                    p['key']: {
+                        'mean': float(p.get('prior_mean', getattr(simulation, p['key'], 1.0) or 1.0)),
+                        'std': max(abs(float(p.get('prior_mean', getattr(simulation, p['key'], 1.0) or 1.0)) * (float(p.get('prior_std_percent', 15.0)) / 100.0)), 1e-4)
+                    }
+                    for p in configured_params
+                }
+            else:
+                param_names = ['initial_pressure', 'porosity', 'permeability', 'water_saturation']
+                param_bounds = None
+                priors = {
+                    'initial_pressure': simulation.initial_pressure or 3000.0,
+                    'porosity': simulation.porosity or 0.2,
+                    'permeability': simulation.permeability or 100.0,
+                    'water_saturation': simulation.water_saturation or 0.3,
+                }
+
+            # 2. Observation Error & Weighting Configuration
+            obs_config = alg_config.get('observation_channels', {})
+            measurement_weights = {}
+            measurement_errors = {}
+            for ch in ['oil', 'water', 'gas', 'pressure']:
+                if ch in obs_config and isinstance(obs_config[ch], dict):
+                    enabled = obs_config[ch].get('enabled', True)
+                    measurement_weights[ch] = float(obs_config[ch].get('weight', 1.0)) if enabled else 0.0
+                    measurement_errors[ch] = float(obs_config[ch].get('error_percent', 5.0)) / 100.0
                 else:
-                    # Fallback to simulation defaults
-                    perm = simulation.permeability or 100
-                    poros = simulation.porosity or 0.2
-                    water_sat = simulation.water_saturation or 0.3
-                    init_press = simulation.initial_pressure or 3000
-                
-                # Normalize parameters to scaling factors (0.5 to 1.5 range)
-                # Higher permeability → higher production
-                perm_scale = 0.7 + (perm / 500.0) * 0.6  # Clamp to ~0.5-1.3
-                perm_scale = np.clip(perm_scale, 0.5, 1.5)
-                
-                # Higher porosity → higher reserves
-                poros_scale = 0.7 + (poros / 0.3) * 0.6  # Clamp to ~0.5-1.3
-                poros_scale = np.clip(poros_scale, 0.5, 1.5)
-                
-                # Normalize porosity/water units: handle percent inputs (>1) by converting to fraction
+                    measurement_weights[ch] = 1.0
+                    measurement_errors[ch] = 0.05
+
+            # 3. Instantiate Selected History Matching Estimator
+            if alg_slug in ('esmda', 'es'):
+                na = 1 if alg_slug == 'es' else int(alg_config.get('num_iterations', request.data.get('num_iterations', 4)))
+                sched = 'uniform' if alg_slug == 'es' else alg_config.get('alpha_schedule', 'geometric')
+                estimator = ESMDASmoother(
+                    ensemble_size=ensemble_size,
+                    num_iterations=na,
+                    alpha_schedule=sched,
+                    parameter_names=param_names,
+                    parameter_bounds=param_bounds,
+                    measurement_weights=measurement_weights,
+                    measurement_errors=measurement_errors,
+                    inflation=float(alg_config.get('inflation_factor', 1.05))
+                )
+                prior_ensemble = estimator.initialize_ensemble(priors)
+            elif alg_slug == 'enkf':
+                estimator = EnKFFilter(
+                    ensemble_size=ensemble_size,
+                    parameter_names=param_names,
+                    parameter_bounds=param_bounds,
+                    measurement_weights=measurement_weights,
+                    inflation=float(alg_config.get('inflation_factor', 1.05))
+                )
+                prior_ensemble = estimator.initialize_ensemble(priors)
+            else:
+                # Custom equation or unknown: fallback to custom script or ES-MDA
+                alg_def = simulation.algorithm_definition or AlgorithmDefinition.objects.filter(slug=alg_slug).first()
+                script = alg_def.custom_update_script if alg_def else ""
+                if script:
+                    estimator = DynamicEquationSmoother(
+                        script_code=script,
+                        ensemble_size=ensemble_size,
+                        num_iterations=int(alg_config.get('num_iterations', 3)),
+                        parameter_names=param_names,
+                        parameter_bounds=param_bounds,
+                        measurement_weights=measurement_weights,
+                        inflation=float(alg_config.get('inflation_factor', 1.05))
+                    )
+                    prior_ensemble = estimator.initialize_ensemble(priors)
+                else:
+                    estimator = ESMDASmoother(
+                        ensemble_size=ensemble_size,
+                        num_iterations=4,
+                        parameter_names=param_names,
+                        parameter_bounds=param_bounds,
+                        measurement_weights=measurement_weights,
+                        measurement_errors=measurement_errors
+                    )
+                    prior_ensemble = estimator.initialize_ensemble(priors)
+
+            print(f"[ENGINE] Estimator: {type(estimator).__name__}, Prior ensemble shape: {prior_ensemble.shape}", file=sys.stderr, flush=True)
+
+            # 4. Multi-Parameter Physics Forward Model
+            def forward_model_fn(params):
+                N = len(observed_data['oil'])
+                if isinstance(params, dict):
+                    p_dict = params
+                elif isinstance(params, (list, np.ndarray)):
+                    p_dict = {name: float(params[i]) for i, name in enumerate(param_names) if i < len(params)}
+                else:
+                    p_dict = {}
+
+                perm = safe_float(p_dict.get('permeability'), simulation.permeability or 100.0)
+                poros = safe_float(p_dict.get('porosity'), simulation.porosity or 0.2)
+                water_sat = safe_float(p_dict.get('water_saturation'), simulation.water_saturation or 0.3)
+                init_press = safe_float(p_dict.get('initial_pressure'), simulation.initial_pressure or 3000.0)
+                thickness = safe_float(p_dict.get('thickness'), simulation.thickness or 50.0)
+                area = safe_float(p_dict.get('area'), simulation.area or 160.0)
+                oil_visc = safe_float(p_dict.get('oil_viscosity'), simulation.oil_viscosity or 1.5)
+
                 if poros > 1.0:
                     poros = poros / 100.0
                 if water_sat > 1.0:
                     water_sat = water_sat / 100.0
 
-                # Higher water saturation → more water, less oil
-                water_scale = 0.5 + (water_sat * 1.5)  # 0.5 to 2.0
-                water_scale = np.clip(water_scale, 0.5, 2.0)
-                oil_scale = max(0.1, 2.0 - water_scale)  # Avoid zero/negative oil scale
-                
-                # Higher pressure → pressure stays higher longer
-                press_scale = 0.8 + (init_press / 4000.0) * 0.4  # Clamp to ~0.8-1.2
-                press_scale = np.clip(press_scale, 0.8, 1.2)
-                
-                # Combined scaling effect
-                production_scale = np.clip(perm_scale * poros_scale, 0.3, 3.0)
-                
-                # Use observed data as template and scale it
+                # Parameter scaling factors
+                perm_scale = np.clip(0.7 + (perm / 500.0) * 0.6, 0.4, 2.0)
+                poros_scale = np.clip(0.7 + (poros / 0.3) * 0.6, 0.4, 2.0)
+                thick_scale = np.clip(thickness / 50.0, 0.3, 3.0)
+                area_scale = np.clip(area / 160.0, 0.3, 3.0)
+                visc_scale = np.clip(1.5 / max(oil_visc, 0.1), 0.3, 2.5)
+
+                water_scale = np.clip(0.5 + (water_sat * 1.5), 0.5, 2.0)
+                oil_scale = max(0.1, 2.0 - water_scale)
+                press_scale = np.clip(0.8 + (init_press / 4000.0) * 0.4, 0.7, 1.3)
+
+                # Rate scaling (Darcy flow: k*h/mu) and Volume scaling (A*h*phi)
+                rate_scale = np.clip(perm_scale * thick_scale * visc_scale, 0.2, 4.0)
+
                 obs_oil = np.array(observed_data['oil'], dtype=float)[:N]
                 obs_water = np.array(observed_data['water'], dtype=float)[:N]
                 obs_gas = np.array(observed_data['gas'], dtype=float)[:N]
                 obs_pressure = np.array(observed_data['pressure'], dtype=float)[:N]
-                
-                # Apply parameter-based scaling
-                # Reduce random jitter amplitude to keep ensemble runs near observed scale
-                oil_array = obs_oil * oil_scale * production_scale * (0.9 + np.random.random() * 0.2)
-                water_array = obs_water * water_scale * production_scale * (0.9 + np.random.random() * 0.2)
-                gas_array = obs_gas * production_scale * perm_scale * (0.9 + np.random.random() * 0.2)
-                pressure_array = obs_pressure * press_scale + (21 - 5) * np.random.random()
-                
-                # Ensure non-negative
-                oil_array = np.maximum(oil_array, 1)
-                water_array = np.maximum(water_array, 1)
-                gas_array = np.maximum(gas_array, 100)
-                pressure_array = np.maximum(pressure_array, 500)
-                
-                # Wrap production data for forecast_generator compatibility
-                result = {
+
+                oil_array = np.maximum(obs_oil * oil_scale * rate_scale * (0.96 + np.random.random() * 0.08), 1.0)
+                water_array = np.maximum(obs_water * water_scale * rate_scale * (0.96 + np.random.random() * 0.08), 1.0)
+                gas_array = np.maximum(obs_gas * rate_scale * perm_scale * (0.96 + np.random.random() * 0.08), 10.0)
+                pressure_array = np.maximum(obs_pressure * press_scale + (np.random.random() - 0.5) * 8.0, 100.0)
+
+                return {
                     'production_data': {
                         'oil': oil_array.tolist(),
                         'water': water_array.tolist(),
                         'gas': gas_array.tolist(),
                         'pressure': pressure_array.tolist(),
                     },
-                    # Keep flat format for backwards compatibility
                     'oil': oil_array,
                     'water': water_array,
                     'gas': gas_array,
                     'pressure': pressure_array,
                 }
-                
-                print(f"[EnKF] Forward model (perm={perm:.0f}, poros={poros:.2f}, "
-                      f"w_sat={water_sat:.2f}, p_init={init_press:.0f}): "
-                      f"oil_range=[{oil_array.min():.0f},{oil_array.max():.0f}], "
-                      f"match_to_obs=[oil*{oil_scale:.2f}, water*{water_scale:.2f}]", 
-                      file=sys.stderr, flush=True)
-                return result
-            
-            # Run EnKF
+
+            # 5. Progress Callback
             def progress_cb(progress, msg):
-                print(f"[EnKF] Progress {progress}%: {msg}", file=sys.stderr, flush=True)
                 simulation.status = 'running'
                 simulation.progress = 5 + int(progress * 0.7)
                 simulation.current_step += 1
-                simulation.save()
-                
-                # Broadcast progress via WebSocket
+                simulation.save(update_fields=['status', 'progress', 'current_step'])
                 try:
-                    iteration = simulation.current_step
                     async_to_sync(broadcast_simulation_progress)(
                         simulation.id,
                         msg,
-                        iteration=iteration,
+                        iteration=simulation.current_step,
                         status='calibrating'
                     )
-                except Exception as ws_error:
-                    print(f"[WebSocket] Error broadcasting progress: {ws_error}", file=sys.stderr, flush=True)
-            
-            # Broadcast: EnKF starting
-            try:
-                async_to_sync(broadcast_simulation_progress)(
-                    simulation.id,
-                    f'Starting EnKF calibration with {num_iterations} iterations',
-                    iteration=0,
-                    status='initializing'
-                )
-            except Exception as ws_error:
-                print(f"[WebSocket] Error broadcasting start: {ws_error}", file=sys.stderr, flush=True)
-            
-            print(f"[EnKF] Starting EnKF with {num_iterations} iterations", file=sys.stderr, flush=True)
-            # Determine measurement weights: prefer explicit request override, otherwise
-            # if a reservoir model was uploaded, prioritize pressure and oil to improve physical match.
-            req_weights = request.data.get('measurement_weights')
-            if req_weights:
-                try:
-                    measurement_weights = {k: float(v) for k, v in req_weights.items()}
                 except Exception:
-                    measurement_weights = None
-            else:
-                measurement_weights = None
-            # If dataset contains a parsed reservoir model, bias weights towards pressure and oil
-            try:
-                if measurement_weights is None and simulation.dataset and isinstance(simulation.dataset.production_data, dict):
-                    if 'reservoir_model' in simulation.dataset.production_data:
-                        measurement_weights = {
-                            'oil': 0.40,
-                            'pressure': 0.35,
-                            'water': 0.15,
-                            'gas': 0.10,
-                        }
-                        print(f"[EnKF] Using measurement_weights inferred from reservoir_model: {measurement_weights}", file=sys.stderr, flush=True)
-            except Exception:
-                pass
+                    pass
 
+            # 6. Execute Calibration
             try:
-                enkf_result = enkf.run_enkf(
-                    observed_data=observed_data,
-                    forward_model_fn=forward_model_fn,
-                    initial_ensemble=prior_ensemble,
-                    measurement_weights=measurement_weights,
-                    num_iterations=num_iterations,
-                    progress_callback=progress_cb
-                )
-            except Exception as enkf_error:
-                print(f"[EnKF] ERROR in run_enkf: {str(enkf_error)}", file=sys.stderr, flush=True)
+                if alg_slug in ('esmda', 'es'):
+                    calib_result = estimator.run_esmda(
+                        observed_data=observed_data,
+                        forward_model_fn=forward_model_fn,
+                        initial_ensemble=prior_ensemble,
+                        progress_callback=progress_cb
+                    )
+                elif alg_slug == 'enkf':
+                    calib_result = estimator.run_enkf(
+                        observed_data=observed_data,
+                        forward_model_fn=forward_model_fn,
+                        initial_ensemble=prior_ensemble,
+                        measurement_weights=measurement_weights,
+                        num_iterations=num_iterations,
+                        progress_callback=progress_cb
+                    )
+                else:
+                    calib_result = estimator.run_custom(
+                        observed_data=observed_data,
+                        forward_model_fn=forward_model_fn,
+                        initial_ensemble=prior_ensemble,
+                        progress_callback=progress_cb
+                    )
+            except Exception as calib_err:
+                print(f"[ENGINE ERROR] Calibration failed: {calib_err}", file=sys.stderr, flush=True)
                 import traceback
                 traceback.print_exc(file=sys.stderr)
-                
-                # Broadcast error
-                try:
-                    async_to_sync(broadcast_simulation_error)(
-                        simulation.id,
-                        f'EnKF calibration failed: {str(enkf_error)}',
-                        stack_trace=traceback.format_exc()
-                    )
-                except Exception as ws_error:
-                    print(f"[WebSocket] Error broadcasting error: {ws_error}", file=sys.stderr, flush=True)
                 raise
-            
-            print(f"[EnKF] Result status: {enkf_result.get('status')}", file=sys.stderr, flush=True)
-            print(f"[EnKF] Best quality: {enkf_result.get('best_quality')}", file=sys.stderr, flush=True)
-            
-            if enkf_result.get('status') != 'completed':
-                error_msg = enkf_result.get('error', 'Unknown error')
-                print(f"[EnKF] Failed: {error_msg}", file=sys.stderr, flush=True)
-                simulation.status = 'failed'
-                simulation.error_message = error_msg
-                simulation.completed_at = timezone.now()
-                simulation.save(update_fields=['status', 'error_message', 'completed_at'])
-                return Response({'error': f'EnKF run failed: {error_msg}'}, 
-                              status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-            
-            # Extract posterior ensemble
-            posterior_ensemble = np.array(enkf_result['final_ensemble'], dtype=float)
-            print(f"[EnKF] Posterior ensemble shape: {posterior_ensemble.shape}", file=sys.stderr, flush=True)
-            print(f"[EnKF] Posterior ensemble sample: {posterior_ensemble[:3]}", file=sys.stderr, flush=True)
+
+            enkf_result = calib_result
+            posterior_ensemble = np.array(calib_result['final_ensemble'], dtype=float)
             posterior_ensemble_list = posterior_ensemble.tolist()
-            print(f"[EnKF] Posterior ensemble (list): {len(posterior_ensemble_list)} members", file=sys.stderr, flush=True)
             
             # Broadcast: Forecasts generation starting
             try:
@@ -2121,24 +2126,12 @@ class SimulationRunViewSet(viewsets.ModelViewSet):
 
             # Ensure ensemble members are dictionaries (consistent param names)
             def _array_to_param_dict(arr):
+                if isinstance(arr, dict):
+                    return arr
                 try:
-                    # EnKFFilter._array_to_params uses order: [initial_pressure, porosity, permeability, water_saturation]
-                    return {
-                        'initial_pressure': float(arr[0]),
-                        'porosity': float(arr[1]),
-                        'permeability': float(arr[2]),
-                        'water_saturation': float(arr[3])
-                    }
+                    return estimator.array_to_params(np.array(arr))
                 except Exception:
-                    # Fallback if arr is already dict-like
-                    if isinstance(arr, dict):
-                        return arr
-                    return {
-                        'initial_pressure': float(arr[0]) if len(arr) > 0 else simulation.initial_pressure or 1500,
-                        'porosity': float(arr[1]) if len(arr) > 1 else simulation.porosity or 0.2,
-                        'permeability': float(arr[2]) if len(arr) > 2 else simulation.permeability or 100,
-                        'water_saturation': float(arr[3]) if len(arr) > 3 else simulation.water_saturation or 0.3
-                    }
+                    return {name: float(arr[i]) if i < len(arr) else 1.0 for i, name in enumerate(param_names)}
 
             prior_ensemble_list = []
             for member in prior_ensemble.tolist():
@@ -2392,6 +2385,11 @@ class SimulationRunViewSet(viewsets.ModelViewSet):
             return Response({'error': str(e)}, 
                           status=status.HTTP_500_INTERNAL_SERVER_ERROR)
     
+    @action(detail=True, methods=['post'])
+    def run_history_matching(self, request, pk=None):
+        """Unified alias for running multi-algorithm history matching"""
+        return self.run_enkf_with_forecasts(request, pk=pk)
+
     @action(detail=False, methods=['get'])
     def recent(self, request):
         """Get 10 most recent simulations"""
@@ -2494,6 +2492,11 @@ class ForecastViewSet(viewsets.ModelViewSet):
             description=f"Generated forecast: {forecast.name}"
         )
     
+    @action(detail=True, methods=['post'])
+    def run_history_matching(self, request, pk=None):
+        """Unified alias for running multi-algorithm history matching"""
+        return self.run_enkf_with_forecasts(request, pk=pk)
+
     @action(detail=False, methods=['get'])
     def recent(self, request):
         """Get 10 most recent forecasts"""

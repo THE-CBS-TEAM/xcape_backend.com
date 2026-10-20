@@ -31,12 +31,78 @@ class Dataset(models.Model):
         return f"{user_name} - {self.name}"
 
 
+class AlgorithmDefinition(models.Model):
+    """Dynamically registered history matching algorithms and update equations"""
+
+    CATEGORY_CHOICES = [
+        ('smoother', 'Ensemble Smoother (Global History)'),
+        ('filter', 'Ensemble Filter (Sequential Timestep)'),
+        ('optimization', 'Optimization & Metaheuristics'),
+        ('custom_equation', 'Custom Equation / Mathematical Formulation'),
+    ]
+
+    EXECUTION_MODE_CHOICES = [
+        ('builtin_esmda', 'Built-in ES-MDA Engine'),
+        ('builtin_enkf', 'Built-in EnKF Engine'),
+        ('builtin_es', 'Built-in Single-Step ES Engine'),
+        ('custom_script', 'Dynamic Python Equation Script'),
+    ]
+
+    name = models.CharField(max_length=150, unique=True, help_text="e.g. Ensemble Smoother with Multiple Data Assimilation")
+    slug = models.SlugField(max_length=50, unique=True, help_text="Unique identifier e.g. esmda, enkf, es, custom_mda")
+    category = models.CharField(max_length=30, choices=CATEGORY_CHOICES, default='smoother')
+    execution_mode = models.CharField(max_length=30, choices=EXECUTION_MODE_CHOICES, default='builtin_esmda')
+
+    # Mathematical & Documentation metadata
+    equation_latex = models.TextField(
+        blank=True,
+        help_text="LaTeX equation representing the algorithm (rendered in frontend info callouts)"
+    )
+    description = models.TextField(help_text="Detailed description of the algorithm and mathematical assumptions")
+    references = models.TextField(blank=True, help_text="Academic citations (e.g. Emerick & Reynolds, 2013)")
+
+    # Dynamic Hyperparameter Schema (JSON)
+    hyperparameter_schema = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text="Schema defining configurable inputs: ensemble size, iterations, alpha schedules, tolerance, etc."
+    )
+    default_hyperparameters = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text="Default values for the hyperparameters"
+    )
+
+    # Dynamic Equation / Update Step Script (for execution_mode='custom_script')
+    custom_update_script = models.TextField(
+        blank=True,
+        help_text="Python code block executing the ensemble update step: def update_step(ensemble, simulated, observations, cov_obs, **kwargs) -> updated_ensemble"
+    )
+
+    is_active = models.BooleanField(default=True, help_text="Whether this algorithm is visible and selectable in the simulator UI")
+    is_default = models.BooleanField(default=False, help_text="Whether this is the default algorithm selected on simulator load")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'algorithm_definition'
+        ordering = ['-is_default', 'name']
+        verbose_name = 'Algorithm Definition'
+        verbose_name_plural = 'Algorithm Definitions'
+
+    def __str__(self):
+        return f"{self.name} ({self.slug}) [{'ACTIVE' if self.is_active else 'INACTIVE'}]"
+
+
 class SimulationRun(models.Model):
     """Track all simulation runs performed by users"""
     
     MATCHING_TYPE_CHOICES = [
         ('baseline', 'Baseline Matching'),
         ('enkf', 'Ensemble Kalman Filter (EnKF)'),
+        ('esmda', 'Ensemble Smoother with Multiple Data Assimilation (ES-MDA)'),
+        ('es', 'Single-Step Ensemble Smoother (ES)'),
+        ('custom_equation', 'Custom Equation History Matching'),
         ('sensitivity', 'Sensitivity Analysis'),
     ]
     
@@ -51,13 +117,26 @@ class SimulationRun(models.Model):
     # User and dataset association
     user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='simulation_runs')
     dataset = models.ForeignKey(Dataset, on_delete=models.SET_NULL, null=True, blank=True,
-                                related_name='simulations')
+                                 related_name='simulations')
+    algorithm_definition = models.ForeignKey(
+        AlgorithmDefinition,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='simulation_runs',
+        help_text="Dynamic algorithm configuration used for this run"
+    )
     
     # Simulation configuration
     name = models.CharField(max_length=255)
     description = models.TextField(blank=True, null=True)
     matching_type = models.CharField(max_length=20, choices=MATCHING_TYPE_CHOICES)
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending')
+    algorithm_config = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text="Configured parameters, priors, bounds, observation weights, and hyperparameters"
+    )
     
     # Parameters (oilfield units)
     initial_pressure = models.FloatField(help_text="psi")

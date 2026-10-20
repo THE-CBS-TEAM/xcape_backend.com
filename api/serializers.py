@@ -1,7 +1,7 @@
 from rest_framework import serializers
 from django.contrib.auth import get_user_model
 from users.models import UserActivityLog, CustomUser
-from simulations.models import Dataset, SimulationRun, Forecast, SimulationStatistics
+from simulations.models import Dataset, SimulationRun, Forecast, SimulationStatistics, AlgorithmDefinition
 import sys
 
 User = get_user_model()
@@ -175,6 +175,19 @@ class DatasetSerializer(serializers.ModelSerializer):
         return dataset
 
 
+class AlgorithmDefinitionSerializer(serializers.ModelSerializer):
+    """Serializer for dynamically registered history matching algorithms"""
+
+    class Meta:
+        model = AlgorithmDefinition
+        fields = [
+            'id', 'name', 'slug', 'category', 'execution_mode',
+            'equation_latex', 'description', 'references',
+            'hyperparameter_schema', 'default_hyperparameters',
+            'is_active', 'is_default'
+        ]
+
+
 class SimulationRunListSerializer(serializers.ModelSerializer):
     dataset_name = serializers.CharField(source='dataset.name', read_only=True)
     
@@ -187,11 +200,12 @@ class SimulationRunListSerializer(serializers.ModelSerializer):
 
 class SimulationRunDetailSerializer(serializers.ModelSerializer):
     dataset = DatasetSerializer(read_only=True)
+    algorithm_definition = AlgorithmDefinitionSerializer(read_only=True)
     forecasts = serializers.SerializerMethodField()
     
     class Meta:
         model = SimulationRun
-        fields = ['id', 'name', 'description', 'matching_type', 'status', 'dataset',
+        fields = ['id', 'name', 'description', 'matching_type', 'status', 'dataset', 'algorithm_definition', 'algorithm_config',
                   'initial_pressure', 'porosity', 'permeability', 'water_saturation',
                   'oil_viscosity', 'rock_compressibility', 'thickness', 'area',
                   'oil_formation_volume_factor', 'oil_initial_saturation',
@@ -211,7 +225,7 @@ class SimulationRunDetailSerializer(serializers.ModelSerializer):
 class SimulationRunCreateSerializer(serializers.ModelSerializer):
     class Meta:
         model = SimulationRun
-        fields = ['id', 'name', 'description', 'matching_type', 'dataset',
+        fields = ['id', 'name', 'description', 'matching_type', 'dataset', 'algorithm_definition', 'algorithm_config',
                   'initial_pressure', 'porosity', 'permeability', 'water_saturation',
                   'oil_viscosity', 'rock_compressibility', 'thickness', 'area',
                   'oil_formation_volume_factor', 'oil_initial_saturation',
