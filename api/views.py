@@ -1289,6 +1289,7 @@ class AlgorithmDefinitionViewSet(viewsets.ReadOnlyModelViewSet):
     queryset = AlgorithmDefinition.objects.filter(is_active=True).order_by('-is_default', 'name')
     serializer_class = AlgorithmDefinitionSerializer
     permission_classes = [permissions.AllowAny]
+    pagination_class = None
 
 
 class SimulationRunViewSet(viewsets.ModelViewSet):
@@ -2606,6 +2607,7 @@ class WorkspaceViewSet(viewsets.ModelViewSet):
     """Collaborative workspace management, member roles, and one-time invitation links"""
     serializer_class = WorkspaceSerializer
     permission_classes = [IsAuthenticated]
+    pagination_class = None
 
     def get_queryset(self):
         user = self.request.user
