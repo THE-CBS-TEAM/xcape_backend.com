@@ -109,13 +109,20 @@ DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 AUTH_USER_MODEL = 'users.CustomUser'
 
-DEFAULT_CORS = 'http://localhost:3000,http://localhost:5173,http://127.0.0.1:3000,http://127.0.0.1:5173'
+DEFAULT_CORS = 'http://localhost:3000,http://localhost:5173,http://127.0.0.1:3000,http://127.0.0.1:5173,https://xcape-com.onrender.com'
 CORS_ALLOWED_ORIGINS = [
     origin.strip() for origin in os.getenv('CORS_ALLOWED_ORIGINS', DEFAULT_CORS).split(',') if origin.strip()
 ]
 CORS_ALLOW_CREDENTIALS = True
+from corsheaders.defaults import default_headers
 
-DEFAULT_CSRF = 'http://localhost:3000,http://localhost:5173,http://127.0.0.1:3000,http://127.0.0.1:5173,https://xcape-backend-com.onrender.com'
+CORS_ALLOW_HEADERS = list(default_headers) + [
+    'x-workspace-id',
+    'x-csrftoken',
+]
+
+
+DEFAULT_CSRF = 'http://localhost:3000,http://localhost:5173,http://127.0.0.1:3000,http://127.0.0.1:5173,https://xcape-com.onrender.com,https://xcape-backend-com.onrender.com'
 CSRF_TRUSTED_ORIGINS = [
     origin.strip() for origin in os.getenv('CSRF_TRUSTED_ORIGINS', DEFAULT_CSRF).split(',') if origin.strip()
 ]

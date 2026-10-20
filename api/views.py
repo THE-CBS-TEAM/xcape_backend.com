@@ -397,16 +397,12 @@ class AuthenticationViewSet(viewsets.ViewSet):
     
     @action(detail=False, methods=['post'], permission_classes=[IsAuthenticated])
     def refresh_token(self, request):
-        """Generate a new authentication token"""
+        """Ensure valid, stable authentication token for user without invalidating active sessions"""
         user = request.user
-        token, created = Token.objects.get_or_create(user=user)
-        if not created:
-            token.delete()
-            token = Token.objects.create(user=user)
-        
+        token, _ = Token.objects.get_or_create(user=user)
         return Response({
             'token': token.key,
-            'message': 'Token refreshed'
+            'message': 'Token active'
         }, status=status.HTTP_200_OK)
     
     @staticmethod
